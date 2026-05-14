@@ -2,12 +2,19 @@
 台股自動化篩選 Streamlit Web App
 對應原始 Excel「總表 2」的 VBA RUN 按鈕邏輯
 
+FinMind TaiwanStockDividend 實際欄位（寬表格，每列一次除息）：
+  date                      = 除息日
+  year                      = 年度（例如 113年第4季）
+  CashEarningsDistribution  = 盈餘分配現金股利（元/股）← 主要現金股利
+  CashStatutorySurplus      = 法定公積現金股利（元/股）
+  現金股利合計 = CashEarningsDistribution + CashStatutorySurplus
+
 Excel 欄位對應：
-  殖利率             → H欄  = 最近現金股利 / 當前股價
-  10年股利次數        → P欄  = 近10年現金股利發放次數
+  殖利率             → H欄  = 現金股利合計 / 當前股價
+  10年股利次數        → P欄  = 近10年有發現金股利的次數（列數）
   累計營收年增率(%)   → Z欄  = 今年累積營收 / 去年同期 - 1
   營收增率%(與前月比) → AA欄 = 當月營收 / 上月營收 - 1
-  EPS年度比較        → AB欄 = 近4季EPS / 去年同期4季EPS
+  EPS年度比較        → AB欄 = 近4季EPS / 前4季EPS
   EPS推隔年殖利率    → AC欄 = (近3年平均EPS × 配息率) / 股價
 """
 
@@ -21,7 +28,6 @@ import time
 
 # ─────────────────────────────────────────────────────
 # Token：優先從 Streamlit Cloud Secrets 讀取
-# Secrets 設定：Settings → Secrets → FINMIND_TOKEN = "你的token"
 # ─────────────────────────────────────────────────────
 try:
     _SECRET_TOKEN = st.secrets.get("FINMIND_TOKEN", "")
@@ -43,10 +49,7 @@ FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
 # ─────────────────────────────────────────────────────
 
 def finmind_get(dataset: str, stock_id: str, start_date: str, token: str = ""):
-    """
-    FinMind API 查詢。
-    回傳 (DataFrame, raw_dict)，raw_dict 用於診斷。
-    """
+    """FinMind API 查詢，回傳 (DataFrame, raw_dict)。"""
     params = {"dataset": dataset, "data_id": stock_id, "start_date": start_date}
     if token:
         params["token"] = token
@@ -61,7 +64,7 @@ def finmind_get(dataset: str, stock_id: str, start_date: str, token: str = ""):
 
 
 def get_price(stock_id: str) -> float:
-    """yfinance 取台股現價，格式 2330.TW"""
+    """yfinance 取台股現價，格式 XXXX.TW"""
     try:
         t = yf.Ticker(f"{stock_id}.TW")
         p = t.fast_info.last_price
@@ -75,30 +78,16 @@ def get_price(stock_id: str) -> float:
     return np.nan
 
 
-def _find_col(df: pd.DataFrame, candidates: list) -> str | None:
-    """在 DataFrame 中依優先序找到第一個存在的欄位名稱。"""
-    for col in candidates:
+def get_cash_dividend(df: pd.DataFrame) -> pd.Series:
+    """
+    從 TaiwanStockDividend 寬表計算每列的現金股利合計。
+    現金股利 = CashEarningsDistribution + CashStatutorySurplus
+    """
+    result = pd.Series(0.0, index=df.index)
+    for col in ["CashEarningsDistribution", "CashStatutorySurplus"]:
         if col in df.columns:
-            return col
-    return None
-
-
-def _get_cash_div_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    從股利 DataFrame 中篩出「現金股利」列。
-    FinMind 欄位名稱可能是 stock_or_cash（值為 Cash）或其他變體，
-    此函式自動偵測，避免 KeyError。
-    """
-    type_col = _find_col(df, ["stock_or_cash", "StockOrCash", "dividend_type", "type"])
-    if type_col:
-        return df[df[type_col].astype(str).str.contains("Cash|cash", na=False)].copy()
-    # 找不到分類欄位時，回傳全部（最保守的 fallback）
-    return df.copy()
-
-
-def _get_div_amount(df: pd.DataFrame) -> str | None:
-    """自動偵測股利金額欄位名稱。"""
-    return _find_col(df, ["cash_dividend", "CashDividend", "dividend", "amount"])
+            result += pd.to_numeric(df[col], errors="coerce").fillna(0)
+    return result
 
 
 # ─────────────────────────────────────────────────────
@@ -107,53 +96,48 @@ def _get_div_amount(df: pd.DataFrame) -> str | None:
 
 def calc_dividend_yield(stock_id: str, token: str) -> float:
     """
-    殖利率 = 最近一次現金股利(元/股) / 當前股價
+    殖利率 = 近一年現金股利合計 / 當前股價
     對應 Excel H欄「殖利率」
+    現金股利 = CashEarningsDistribution + CashStatutorySurplus
     """
     price = get_price(stock_id)
     if np.isnan(price):
         return np.nan
 
+    # 抓近500天（涵蓋近一年除息）
     start = (datetime.now() - timedelta(days=500)).strftime("%Y-%m-%d")
     df, _ = finmind_get("TaiwanStockDividend", stock_id, start, token)
     if df.empty:
         return np.nan
 
-    cash_df = _get_cash_div_df(df)
-    if cash_df.empty:
+    df["cash_div"] = get_cash_dividend(df)
+    # 只保留有發現金股利的列
+    df = df[df["cash_div"] > 0].sort_values("date")
+    if df.empty:
         return np.nan
 
-    amt_col = _get_div_amount(cash_df)
-    if not amt_col:
-        return np.nan
-
-    cash_df[amt_col] = pd.to_numeric(cash_df[amt_col], errors="coerce")
-    cash_df = cash_df.dropna(subset=[amt_col]).sort_values("date")
-    if cash_df.empty:
-        return np.nan
-
-    return float(cash_df.iloc[-1][amt_col]) / price
+    # 近一年現金股利加總（台積電等季配公司會有多筆）
+    total_div = df["cash_div"].sum()
+    return total_div / price
 
 
 def calc_dividend_count_10y(stock_id: str, token: str) -> int:
     """
-    10年股利次數 = 近10年現金股利發放筆數
+    10年股利次數 = 近10年有發現金股利的次數（列數）
     對應 Excel P欄「10年股利次數」
     """
     start = (datetime.now() - timedelta(days=3650)).strftime("%Y-%m-%d")
     df, _ = finmind_get("TaiwanStockDividend", stock_id, start, token)
     if df.empty:
         return 0
-    return len(_get_cash_div_df(df))
+    df["cash_div"] = get_cash_dividend(df)
+    return int((df["cash_div"] > 0).sum())
 
 
 def calc_revenue_metrics(stock_id: str, token: str) -> tuple:
     """
     回傳 (累計營收年增率%, 當月vs前月%)
     對應 Excel Z欄「累計營收年增率」、AA欄「營收增率%與前月比」
-
-    累積YTD年增率 = (今年各月營收加總 / 去年同月份營收加總) - 1
-    月增率(MoM)   = (當月 - 上月) / 上月
     """
     start = (datetime.now() - timedelta(days=760)).strftime("%Y-%m-%d")
     df, _ = finmind_get("TaiwanStockMonthRevenue", stock_id, start, token)
@@ -176,7 +160,7 @@ def calc_revenue_metrics(stock_id: str, token: str) -> tuple:
         if not prev_same.empty and prev_same["revenue"].sum() != 0:
             ytd = (cur_df["revenue"].sum() / prev_same["revenue"].sum() - 1) * 100
 
-    # MoM
+    # MoM 月增率
     mom = np.nan
     if len(df) >= 2:
         curr_rev = df.iloc[-1]["revenue"]
@@ -195,10 +179,7 @@ def calc_eps_yoy(stock_id: str, token: str) -> float:
     """
     start = (datetime.now() - timedelta(days=900)).strftime("%Y-%m-%d")
     df, _ = finmind_get("TaiwanStockFinancialStatements", stock_id, start, token)
-    if df.empty:
-        return np.nan
-
-    if "type" not in df.columns:
+    if df.empty or "type" not in df.columns:
         return np.nan
 
     eps_df = df[df["type"] == "EPS"][["date", "value"]].copy()
@@ -215,14 +196,15 @@ def calc_eps_yoy(stock_id: str, token: str) -> float:
 
 def calc_eps_est_yield(stock_id: str, token: str) -> float:
     """
-    EPS推隔年殖利率 = (近3年平均EPS × 近3年平均配息率) / 股價
+    EPS推隔年殖利率 = (近3年平均年度EPS × 近3年平均配息率) / 股價
     對應 Excel AC欄「EPS推隔年殖利率」
+    配息率 = 近3年平均現金股利 / 近3年平均EPS
     """
     price = get_price(stock_id)
     if np.isnan(price):
         return np.nan
 
-    # ── 近3年年度EPS ──────────────────────────────
+    # 近3年年度EPS（各年4季加總）
     start_eps = (datetime.now() - timedelta(days=1200)).strftime("%Y-%m-%d")
     df_eps, _ = finmind_get("TaiwanStockFinancialStatements", stock_id, start_eps, token)
     if df_eps.empty or "type" not in df_eps.columns:
@@ -233,29 +215,28 @@ def calc_eps_est_yield(stock_id: str, token: str) -> float:
     eps_df["date"]  = pd.to_datetime(eps_df["date"])
     eps_df = eps_df.dropna().sort_values("date")
     eps_by_year = eps_df.groupby(eps_df["date"].dt.year)["value"].sum()
-
     if eps_by_year.empty:
         return np.nan
     avg_eps = eps_by_year.tail(3).mean()
     if np.isnan(avg_eps) or avg_eps <= 0:
         return np.nan
 
-    # ── 近3年配息率 ───────────────────────────────
+    # 近3年每年現金股利（CashEarningsDistribution + CashStatutorySurplus）
     start_div = (datetime.now() - timedelta(days=1200)).strftime("%Y-%m-%d")
     df_div, _ = finmind_get("TaiwanStockDividend", stock_id, start_div, token)
-
     if df_div.empty:
-        payout = 0.6  # 無股利資料時預設 60%
+        payout = 0.6
     else:
-        cash = _get_cash_div_df(df_div)
-        amt_col = _get_div_amount(cash)
-        if amt_col and not cash.empty:
-            cash[amt_col] = pd.to_numeric(cash[amt_col], errors="coerce")
-            cash = cash.dropna(subset=[amt_col]).sort_values("date").tail(3)
-            avg_div = cash[amt_col].mean() if not cash.empty else avg_eps * 0.6
+        df_div["date"] = pd.to_datetime(df_div["date"])
+        df_div["cash_div"] = get_cash_dividend(df_div)
+        # 以除息年度分組，取近3年年度現金股利加總的平均
+        div_by_year = df_div[df_div["cash_div"] > 0].groupby(
+            df_div["date"].dt.year)["cash_div"].sum()
+        if div_by_year.empty:
+            payout = 0.6
         else:
-            avg_div = avg_eps * 0.6
-        payout = min(avg_div / avg_eps, 1.5)  # 上限 150% 防異常值
+            avg_div = div_by_year.tail(3).mean()
+            payout  = min(avg_div / avg_eps, 1.5)  # 上限150%防異常值
 
     return (avg_eps * payout) / price
 
@@ -287,7 +268,7 @@ def run_screening(
     min_eps_yoy, min_eps_est_yield, token, stock_ids
 ) -> pd.DataFrame:
     """
-    批次掃描所有股票並套用門檻篩選。
+    批次掃描並篩選。
     -100（次數欄用 -1）= 跳過此項，對應 Excel「輸入-100表示不篩選」。
     """
     results = []
@@ -304,12 +285,12 @@ def run_screening(
             eey      = calc_eps_est_yield(sid, token)
 
             ok = True
-            if min_yield > -1         and (np.isnan(dy)  or dy * 100 < min_yield):              ok = False
-            if min_div_count > -1     and dc < min_div_count:                                    ok = False
-            if min_rev_ytd_yoy > -100 and (np.isnan(ytd) or ytd < min_rev_ytd_yoy):             ok = False
-            if min_rev_mom > -100     and (np.isnan(mom) or mom < min_rev_mom):                  ok = False
-            if min_eps_yoy > -1       and (np.isnan(ey)  or ey  < min_eps_yoy):                 ok = False
-            if min_eps_est_yield > -1 and (np.isnan(eey) or eey * 100 < min_eps_est_yield):      ok = False
+            if min_yield > -1         and (np.isnan(dy)  or dy * 100 < min_yield):             ok = False
+            if min_div_count > -1     and dc < min_div_count:                                   ok = False
+            if min_rev_ytd_yoy > -100 and (np.isnan(ytd) or ytd < min_rev_ytd_yoy):            ok = False
+            if min_rev_mom > -100     and (np.isnan(mom) or mom < min_rev_mom):                 ok = False
+            if min_eps_yoy > -1       and (np.isnan(ey)  or ey  < min_eps_yoy):                ok = False
+            if min_eps_est_yield > -1 and (np.isnan(eey) or eey * 100 < min_eps_est_yield):     ok = False
 
             if ok:
                 results.append({
@@ -340,7 +321,7 @@ with st.sidebar:
     st.divider()
 
     min_yield         = st.number_input("殖利率 ≥ (%)",         min_value=-1.0,   max_value=100.0, value=5.0,    step=0.5,  help="-1 = 不篩選")
-    min_div_count     = st.number_input("10年股利次數 ≥",        min_value=-1,     max_value=10,    value=9,      step=1,    help="-1 = 不篩選")
+    min_div_count     = st.number_input("10年股利次數 ≥",        min_value=-1,     max_value=40,    value=9,      step=1,    help="-1 = 不篩選（台積電等季配股每年4次，10年共40次）")
     min_rev_ytd_yoy   = st.number_input("累計營收年增率 ≥ (%)",  min_value=-100.0, max_value=200.0, value=-100.0, step=5.0,  help="-100 = 不篩選")
     min_rev_mom       = st.number_input("營收與前月比 ≥ (%)",    min_value=-100.0, max_value=200.0, value=-100.0, step=5.0,  help="-100 = 不篩選")
     min_eps_yoy       = st.number_input("EPS年度比較 ≥",         min_value=-1.0,   max_value=5.0,   value=0.7,    step=0.05, help="-1 = 不篩選")
@@ -351,8 +332,10 @@ with st.sidebar:
         finmind_token = _SECRET_TOKEN
         st.success("✅ Token 已從 Secrets 載入", icon="🔑")
     else:
-        finmind_token = st.text_input("FinMind Token（選填）", type="password",
-                                      help="在 Streamlit Cloud → Settings → Secrets 設定 FINMIND_TOKEN")
+        finmind_token = st.text_input(
+            "FinMind Token（選填）", type="password",
+            help="Streamlit Cloud → Settings → Secrets → FINMIND_TOKEN"
+        )
 
     max_stocks = st.slider("掃描上限（支）", 20, 500, 100, 20)
     st.divider()
@@ -382,7 +365,6 @@ with tab1:
         with st.spinner("取得股票清單..."):
             all_stocks = get_tw_stock_list(finmind_token)
             if not all_stocks:
-                # fallback：常見台股代碼範圍
                 all_stocks = [str(i) for i in range(1101, 3700)] + [str(i) for i in range(4100, 6900)]
             stock_sample = all_stocks[:max_stocks]
 
@@ -441,7 +423,13 @@ with tab2:
             finmind_token
         )
         if not ddf.empty:
-            st.dataframe(ddf.sort_values("date", ascending=False).head(20), use_container_width=True)
+            ddf["現金股利合計"] = get_cash_dividend(ddf)
+            show_cols = [c for c in ["date", "year", "現金股利合計",
+                                     "CashEarningsDistribution", "CashStatutorySurplus",
+                                     "StockEarningsDistribution", "CashExDividendTradingDate",
+                                     "CashDividendPaymentDate"] if c in ddf.columns or c == "現金股利合計"]
+            st.dataframe(ddf[show_cols].sort_values("date", ascending=False).head(20),
+                         use_container_width=True)
         else:
             st.info("無股利資料")
 
@@ -462,42 +450,41 @@ with tab2:
 
 # ── Tab3：API 診斷 ────────────────────────────────────
 with tab3:
-    st.markdown("""
-**出現 N/A 請先在此診斷**，可看到 FinMind API 實際回傳的欄位名稱與資料內容。
-""")
+    st.markdown("**出現 N/A 請先在此診斷**，可看到 API 實際回傳的欄位與資料。")
     diag_id  = st.text_input("診斷股票代號", value="2330", key="diag")
     diag_btn = st.button("執行診斷", key="diag_btn")
 
     if diag_btn:
         start_diag = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d")
 
-        # ── 1. yfinance 股價 ──────────────────────────
+        # 1. yfinance
         st.markdown("### 1️⃣ yfinance 股價")
         try:
-            t = yf.Ticker(f"{diag_id}.TW")
-            p = t.fast_info.last_price
+            p = yf.Ticker(f"{diag_id}.TW").fast_info.last_price
             st.success(f"✅ 股價：{p}")
         except Exception as e:
-            st.error(f"❌ yfinance 失敗：{e}")
+            st.error(f"❌ {e}")
 
-        # ── 2. 股利 ───────────────────────────────────
+        # 2. 股利
         st.markdown("### 2️⃣ TaiwanStockDividend（股利）")
         df2, raw2 = finmind_get("TaiwanStockDividend", diag_id, start_diag, finmind_token)
         st.write(f"**status:** `{raw2.get('status')}` ｜ **msg:** `{raw2.get('msg', '')}`")
         if not df2.empty:
             st.success(f"✅ {len(df2)} 筆 ｜ 欄位：`{list(df2.columns)}`")
-            # 自動偵測分類欄位並顯示唯一值
-            type_col = _find_col(df2, ["stock_or_cash", "StockOrCash", "dividend_type", "type"])
-            if type_col:
-                st.write(f"**`{type_col}` 唯一值：**", df2[type_col].unique().tolist())
-            else:
-                st.warning("⚠️ 找不到現金/股票分類欄位，所有欄位如上。")
-            st.dataframe(df2.head(10), use_container_width=True)
+            df2["現金股利合計"] = get_cash_dividend(df2)
+            st.write("**CashEarningsDistribution 範例值：**",
+                     pd.to_numeric(df2.get("CashEarningsDistribution", pd.Series()), errors="coerce").tolist()[:5])
+            st.dataframe(df2[["date", "year", "現金股利合計",
+                               "CashEarningsDistribution", "CashStatutorySurplus"]
+                              ].head(10) if all(c in df2.columns for c in
+                              ["CashEarningsDistribution", "CashStatutorySurplus"])
+                              else df2.head(10),
+                         use_container_width=True)
         else:
-            st.error("❌ 無資料，原始回傳：")
+            st.error("❌ 無資料")
             st.json(raw2)
 
-        # ── 3. 月營收 ─────────────────────────────────
+        # 3. 月營收
         st.markdown("### 3️⃣ TaiwanStockMonthRevenue（月營收）")
         df3, raw3 = finmind_get("TaiwanStockMonthRevenue", diag_id, start_diag, finmind_token)
         st.write(f"**status:** `{raw3.get('status')}` ｜ **msg:** `{raw3.get('msg', '')}`")
@@ -505,10 +492,10 @@ with tab3:
             st.success(f"✅ {len(df3)} 筆 ｜ 欄位：`{list(df3.columns)}`")
             st.dataframe(df3.head(5), use_container_width=True)
         else:
-            st.error("❌ 無資料，原始回傳：")
+            st.error("❌ 無資料")
             st.json(raw3)
 
-        # ── 4. 財報 EPS ───────────────────────────────
+        # 4. EPS
         st.markdown("### 4️⃣ TaiwanStockFinancialStatements（EPS）")
         start_eps = (datetime.now() - timedelta(days=900)).strftime("%Y-%m-%d")
         df4, raw4 = finmind_get("TaiwanStockFinancialStatements", diag_id, start_eps, finmind_token)
@@ -516,15 +503,15 @@ with tab3:
         if not df4.empty:
             st.success(f"✅ {len(df4)} 筆 ｜ 欄位：`{list(df4.columns)}`")
             if "type" in df4.columns:
-                st.write("**type 欄位唯一值：**", df4["type"].unique().tolist())
+                st.write("**type 唯一值：**", df4["type"].unique().tolist())
                 st.dataframe(df4[df4["type"] == "EPS"].head(8), use_container_width=True)
             else:
                 st.dataframe(df4.head(8), use_container_width=True)
         else:
-            st.error("❌ 無資料，原始回傳：")
+            st.error("❌ 無資料")
             st.json(raw4)
 
-        # ── 5. 六大指標計算結果 ───────────────────────
+        # 5. 計算結果
         st.markdown("### 5️⃣ 六大指標計算結果")
         with st.spinner("計算中..."):
             r_dy         = calc_dividend_yield(diag_id, finmind_token)
@@ -534,14 +521,14 @@ with tab3:
             r_eey        = calc_eps_est_yield(diag_id, finmind_token)
 
         st.dataframe(pd.DataFrame([
-            {"指標": "殖利率(%)",           "計算值": f"{r_dy*100:.2f}%"   if not np.isnan(r_dy)  else "❌ N/A", "對應Excel欄": "H"},
-            {"指標": "10年股利次數",        "計算值": r_dc,                                                       "對應Excel欄": "P"},
-            {"指標": "累計營收年增率(%)",   "計算值": f"{r_ytd:.2f}%"     if not np.isnan(r_ytd) else "❌ N/A", "對應Excel欄": "Z"},
-            {"指標": "營收與前月比(%)",     "計算值": f"{r_mom:.2f}%"     if not np.isnan(r_mom) else "❌ N/A", "對應Excel欄": "AA"},
-            {"指標": "EPS年度比較",         "計算值": f"{r_ey:.4f}"       if not np.isnan(r_ey)  else "❌ N/A", "對應Excel欄": "AB"},
-            {"指標": "EPS推隔年殖利率(%)",  "計算值": f"{r_eey*100:.2f}%" if not np.isnan(r_eey) else "❌ N/A", "對應Excel欄": "AC"},
+            {"指標": "殖利率(%)",           "計算值": f"{r_dy*100:.2f}%"   if not np.isnan(r_dy)  else "❌ N/A", "Excel欄": "H"},
+            {"指標": "10年股利次數",        "計算值": r_dc,                                                       "Excel欄": "P"},
+            {"指標": "累計營收年增率(%)",   "計算值": f"{r_ytd:.2f}%"     if not np.isnan(r_ytd) else "❌ N/A", "Excel欄": "Z"},
+            {"指標": "營收與前月比(%)",     "計算值": f"{r_mom:.2f}%"     if not np.isnan(r_mom) else "❌ N/A", "Excel欄": "AA"},
+            {"指標": "EPS年度比較",         "計算值": f"{r_ey:.4f}"       if not np.isnan(r_ey)  else "❌ N/A", "Excel欄": "AB"},
+            {"指標": "EPS推隔年殖利率(%)",  "計算值": f"{r_eey*100:.2f}%" if not np.isnan(r_eey) else "❌ N/A", "Excel欄": "AC"},
         ]), use_container_width=True, hide_index=True)
-        st.caption("❌ N/A = 該指標抓不到資料，請對照上方各節原始回傳排查。")
+        st.caption("❌ N/A = 抓不到資料，請對照上方各節原始回傳排查。")
 
 
 # ─────────────────────────────────────────────────────
