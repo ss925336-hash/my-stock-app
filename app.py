@@ -504,7 +504,11 @@ with tab2:
         show_stock_detail(query_id.strip(), finmind_token)
     elif query_btn:
         st.warning("請輸入股票代號。")
+import streamlit as st
 
+# 從 Streamlit Secrets 自動讀取 token（部署環境用）
+# 本機開發時仍可在側邊欄手動輸入
+finmind_token = st.secrets.get("FINMIND_TOKEN", "")
 # ──────────────────────────────────────────────
 # 頁尾說明
 # ──────────────────────────────────────────────
