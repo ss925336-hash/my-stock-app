@@ -1,5 +1,5 @@
 """
-台股自動化篩選 Streamlit Web App
+台股自動化篩選 Streamlit Web App  ─ 最終完整版
 對應原始 Excel「總表」與「總表 2」的邏輯
 
 Excel 總表欄位完整對應：
@@ -14,8 +14,13 @@ Excel 總表欄位完整對應：
   (月)累積營收年增率(%)
   用預估EPS推隔年殖利率(平均加總) → (3年均EPS × 配息率) / 股價
   用預估EPS推隔年殖利率(前季推估) → (近4季累積EPS × 配息率) / 股價
-  推隔年本益比(平均加總)     → 股價 / (3年均EPS × 配息率 / 殖利率門檻)
+  推隔年本益比(平均加總)     → 股價 / 3年均EPS
   昂貴(4%) / 合理(5.5%) / 便宜(7%) → 3年平均股利 / 殖利率門檻
+
+架構說明：
+  按鈕A「🔄 更新市場數據」→ 抓成交前500個股 + 預算所有指標（24h快取）
+  按鈕B「🎯 執行條件篩選」→ 僅對快取數據本地過濾，不耗API
+  Tab2 個股儀表板 → 三步驟搜尋：輸入關鍵字 → 選清單 → 確認執行
 """
 
 import streamlit as st
@@ -46,6 +51,7 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+/* ── 卡片基礎樣式 ── */
 .card {
     background: #1e2130;
     border-radius: 12px;
@@ -53,13 +59,14 @@ st.markdown("""
     margin-bottom: 12px;
     border-left: 4px solid #4a9eff;
 }
-.card-red   { border-left-color: #ff4b4b; }
-.card-green { border-left-color: #21c55d; }
-.card-gold  { border-left-color: #f5a623; }
-.card-blue  { border-left-color: #4a9eff; }
-.card-purple{ border-left-color: #a855f7; }
+.card-red    { border-left-color: #ff4b4b; }
+.card-green  { border-left-color: #21c55d; }
+.card-gold   { border-left-color: #f5a623; }
+.card-blue   { border-left-color: #4a9eff; }
+.card-purple { border-left-color: #a855f7; }
 
-.card-title { font-size:0.72rem; color:#8b9ab0; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:4px; }
+.card-title { font-size:0.72rem; color:#8b9ab0; text-transform:uppercase;
+              letter-spacing:0.08em; margin-bottom:4px; }
 .card-value { font-size:1.7rem; font-weight:700; color:#ffffff; line-height:1.1; }
 .card-value-red    { color:#ff4b4b; }
 .card-value-green  { color:#21c55d; }
@@ -73,22 +80,48 @@ st.markdown("""
     border-bottom:1px solid #30363d;
     margin-bottom:12px; margin-top:4px;
 }
+
+/* ── 手機優化 ── */
+@media (max-width: 768px) {
+    .card-value { font-size:1.3rem; }
+    .card { padding: 12px 14px; }
+}
 </style>
 """, unsafe_allow_html=True)
 
 FINMIND_BASE = "https://api.finmindtrade.com/api/v4/data"
 
 
-# ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
 # 工具函式
-# ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
 
 def finmind_get(dataset, stock_id, start_date, token=""):
+    """通用 FinMind API 請求"""
     params = {"dataset": dataset, "data_id": stock_id, "start_date": start_date}
     if token:
         params["token"] = token
     try:
         r = requests.get(FINMIND_BASE, params=params, timeout=20)
+        raw = r.json()
+        if raw.get("status") == 200 and raw.get("data"):
+            return pd.DataFrame(raw["data"]), raw
+        return pd.DataFrame(), raw
+    except Exception as e:
+        return pd.DataFrame(), {"error": str(e)}
+
+
+def finmind_get_no_id(dataset, start_date, end_date, token=""):
+    """不帶 stock_id 的全市場請求（用於掃描池）"""
+    params = {
+        "dataset": dataset,
+        "start_date": start_date,
+        "end_date":   end_date,
+    }
+    if token:
+        params["token"] = token
+    try:
+        r = requests.get(FINMIND_BASE, params=params, timeout=30)
         raw = r.json()
         if raw.get("status") == 200 and raw.get("data"):
             return pd.DataFrame(raw["data"]), raw
@@ -118,14 +151,11 @@ def extract_cash_dividend(df: pd.DataFrame) -> pd.Series:
     支援兩種資料結構：
     (A) 寬表格：CashEarningsDistribution + CashStatutorySurplus（加總）
     (B) 長表格：stock_or_cash / dividend_type 等分類欄 + cash_dividend 金額欄
-
-    只要 FinMind 有回傳資料，不論欄位大小寫，都能正確加總。
-    回傳 Series（每列對應現金股利金額，非現金列為 0）。
     """
     if df.empty:
         return pd.Series(dtype=float)
 
-    # ── 結構 A：寬表格（有 CashEarningsDistribution）────
+    # ── 結構 A：寬表格 ────────────────────────────────
     cash_cols = [c for c in df.columns
                  if any(k in c for k in ["CashEarnings", "CashStatutory",
                                           "cashearnings", "cashstatutory"])]
@@ -135,7 +165,7 @@ def extract_cash_dividend(df: pd.DataFrame) -> pd.Series:
             result += pd.to_numeric(df[col], errors="coerce").fillna(0)
         return result
 
-    # ── 結構 B：長表格（有 stock_or_cash 分類欄）─────────
+    # ── 結構 B：長表格 ────────────────────────────────
     type_col = next(
         (c for c in df.columns
          if c.lower() in ["stock_or_cash", "stockorcash", "dividend_type",
@@ -153,7 +183,7 @@ def extract_cash_dividend(df: pd.DataFrame) -> pd.Series:
         amounts = pd.to_numeric(df[amt_col], errors="coerce").fillna(0)
         return amounts.where(is_cash, 0.0)
 
-    # ── Fallback：嘗試所有數字欄中最像股利的那欄 ─────────
+    # ── Fallback ──────────────────────────────────────
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     likely = [c for c in num_cols
               if any(k in c.lower() for k in ["div", "cash", "yield", "amount"])]
@@ -187,9 +217,9 @@ def section(title):
     st.markdown(f'<div class="section-title">{title}</div>', unsafe_allow_html=True)
 
 
-# ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
 # 個股完整資料抓取（對應 Excel 總表）
-# ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def get_stock_data(stock_id: str, token: str) -> dict:
@@ -205,7 +235,8 @@ def get_stock_data(stock_id: str, token: str) -> dict:
     # ── 股價歷史（一年，用於走勢圖）──────────────────
     try:
         hist = yf.Ticker(f"{stock_id}.TW").history(period="1y")
-        d["price_hist"] = hist[["Close"]].rename(columns={"Close": "收盤價"}) if not hist.empty else pd.DataFrame()
+        d["price_hist"] = (hist[["Close"]].rename(columns={"Close": "收盤價"})
+                           if not hist.empty else pd.DataFrame())
     except Exception:
         d["price_hist"] = pd.DataFrame()
 
@@ -225,9 +256,9 @@ def get_stock_data(stock_id: str, token: str) -> dict:
     df_div, _ = finmind_get("TaiwanStockDividend", stock_id, start_10y, token)
 
     if not df_div.empty:
-        df_div["_date"]     = pd.to_datetime(df_div["date"])
-        df_div["_cash"]     = extract_cash_dividend(df_div)
-        df_div["_stock"]    = pd.to_numeric(
+        df_div["_date"]  = pd.to_datetime(df_div["date"])
+        df_div["_cash"]  = extract_cash_dividend(df_div)
+        df_div["_stock"] = pd.to_numeric(
             df_div.get("StockEarningsDistribution",
             df_div.get("stock_dividend", 0)), errors="coerce").fillna(0)
 
@@ -235,7 +266,7 @@ def get_stock_data(stock_id: str, token: str) -> dict:
         cutoff_1y = pd.Timestamp(datetime.now() - timedelta(days=500))
         div_1y    = df_div[df_div["_date"] >= cutoff_1y]
         cash_sum  = div_1y["_cash"].sum()
-        d["cash_div"]  = cash_sum
+        d["cash_div"]  = cash_sum if cash_sum > 0 else np.nan
         d["stock_div"] = div_1y["_stock"].sum()
 
         # 除息日、發息日
@@ -243,7 +274,8 @@ def get_stock_data(stock_id: str, token: str) -> dict:
         if not has_cash.empty:
             latest = has_cash.iloc[0]
             d["ex_div_date"] = str(latest["_date"])[:10]
-            pay_col = next((c for c in ["CashDividendPaymentDate", "pay_date"] if c in df_div.columns), None)
+            pay_col = next((c for c in ["CashDividendPaymentDate", "pay_date"]
+                            if c in df_div.columns), None)
             d["pay_date"] = str(latest[pay_col])[:10] if pay_col else "—"
         else:
             d["ex_div_date"] = "—"
@@ -253,12 +285,12 @@ def get_stock_data(stock_id: str, token: str) -> dict:
         d["div_count_10y"] = int((df_div["_cash"] > 0).sum())
 
         # 3/6/10年平均現金股利（按年分組）
-        df_yr = df_div[df_div["_cash"] > 0].copy()
+        df_yr  = df_div[df_div["_cash"] > 0].copy()
         df_yr["_yr"] = df_yr["_date"].dt.year
         yr_sum = df_yr.groupby("_yr")["_cash"].sum().sort_index()
-        d["avg_div_3y"]  = yr_sum.tail(3).mean()  if len(yr_sum) >= 1 else np.nan
-        d["avg_div_6y"]  = yr_sum.tail(6).mean()  if len(yr_sum) >= 1 else np.nan
-        d["avg_div_10y"] = yr_sum.tail(10).mean() if len(yr_sum) >= 1 else np.nan
+        d["avg_div_3y"]  = float(yr_sum.tail(3).mean())  if len(yr_sum) >= 1 else np.nan
+        d["avg_div_6y"]  = float(yr_sum.tail(6).mean())  if len(yr_sum) >= 1 else np.nan
+        d["avg_div_10y"] = float(yr_sum.tail(10).mean()) if len(yr_sum) >= 1 else np.nan
     else:
         d.update({
             "cash_div": np.nan, "stock_div": np.nan,
@@ -276,7 +308,6 @@ def get_stock_data(stock_id: str, token: str) -> dict:
         e["date"]  = pd.to_datetime(e["date"])
         e = e.dropna().sort_values("date").drop_duplicates("date")
 
-        # 各季 EPS（用月份判斷）
         def last_q_eps(months):
             sub = e[e["date"].dt.month.isin(months)]
             return float(sub.tail(1)["value"].iloc[0]) if not sub.empty else np.nan
@@ -292,8 +323,9 @@ def get_stock_data(stock_id: str, token: str) -> dict:
         d["eps_prev"] = float(e.iloc[-8:-4]["value"].sum()) if len(e) >= 8 else np.nan
 
         # EPS 年度比較
-        if not np.isnan(d.get("eps_ytd", np.nan)) and not np.isnan(d.get("eps_prev", np.nan)) \
-                and d["eps_prev"] != 0:
+        if (not np.isnan(d.get("eps_ytd", np.nan))
+                and not np.isnan(d.get("eps_prev", np.nan))
+                and d["eps_prev"] != 0):
             d["eps_yoy"] = d["eps_ytd"] / d["eps_prev"]
         else:
             d["eps_yoy"] = np.nan
@@ -304,20 +336,20 @@ def get_stock_data(stock_id: str, token: str) -> dict:
         else:
             d["pe_ratio"] = np.nan
 
-        # 近3年年度EPS加總 → 平均（用於推估）
+        # 近3年年度EPS → 平均（用於推估）
         e_yr = e.groupby(e["date"].dt.year)["value"].sum()
-        d["avg_eps_3y"] = e_yr.tail(3).mean() if not e_yr.empty else np.nan
+        d["avg_eps_3y"] = float(e_yr.tail(3).mean()) if not e_yr.empty else np.nan
     else:
         d.update({
-            "eps_q1": np.nan, "eps_q2": np.nan, "eps_q3": np.nan, "eps_q4": np.nan,
-            "eps_ytd": np.nan, "eps_prev": np.nan, "eps_yoy": np.nan,
-            "pe_ratio": np.nan, "avg_eps_3y": np.nan,
+            "eps_q1": np.nan, "eps_q2": np.nan,
+            "eps_q3": np.nan, "eps_q4": np.nan,
+            "eps_ytd": np.nan, "eps_prev": np.nan,
+            "eps_yoy": np.nan, "pe_ratio": np.nan, "avg_eps_3y": np.nan,
         })
 
     # ── 配息率 = 近一年現金股利 / 去年EPS ────────────
-    # 對應 Excel 總表「配息率(%)」欄
-    cash_div = d.get("cash_div", np.nan)
-    eps_prev = d.get("eps_prev", np.nan)
+    cash_div   = d.get("cash_div",   np.nan)
+    eps_prev   = d.get("eps_prev",   np.nan)
     avg_div_3y = d.get("avg_div_3y", np.nan)
     avg_eps_3y = d.get("avg_eps_3y", np.nan)
 
@@ -342,17 +374,15 @@ def get_stock_data(stock_id: str, token: str) -> dict:
         d["div_yield"] = np.nan
 
     # ── 推估EPS推隔年殖利率（平均加總）──────────────
-    # 對應 Excel 總表紅字「用預估EPS推隔年殖利率(平均加總)」
-    # 公式：(近3年平均EPS × 近3年平均配息率) / 股價
+    # 對應 Excel 紅字：(近3年平均EPS × 近3年平均配息率) / 股價
     if not np.isnan(avg_eps_3y) and avg_eps_3y > 0 and not np.isnan(price) and price > 0:
-        est_div_avg      = avg_eps_3y * payout_3y
+        est_div_avg        = avg_eps_3y * payout_3y
         d["est_yield_avg"] = est_div_avg / price
     else:
         d["est_yield_avg"] = np.nan
 
     # ── 推估EPS推隔年殖利率（前季推估）──────────────
-    # 對應 Excel 總表紅字「用預估EPS推隔年殖利率(前季推估)」
-    # 公式：近4季累積EPS × 近3年平均配息率 / 股價
+    # 對應 Excel 紅字：近4季累積EPS × 近3年平均配息率 / 股價
     eps_ytd = d.get("eps_ytd", np.nan)
     if not np.isnan(eps_ytd) and eps_ytd > 0 and not np.isnan(price) and price > 0:
         d["est_yield_latest"] = (eps_ytd * payout_3y) / price
@@ -360,8 +390,7 @@ def get_stock_data(stock_id: str, token: str) -> dict:
         d["est_yield_latest"] = np.nan
 
     # ── 推隔年本益比（平均加總）──────────────────────
-    # 對應 Excel 截圖紅字「推隔年本益比(平均加總)」
-    # 公式：股價 / (3年均EPS)  → 用未來預估EPS算本益比
+    # 對應 Excel 紅字：股價 / 3年均EPS
     if not np.isnan(avg_eps_3y) and avg_eps_3y > 0 and not np.isnan(price):
         d["est_pe_avg"] = price / avg_eps_3y
     else:
@@ -373,11 +402,7 @@ def get_stock_data(stock_id: str, token: str) -> dict:
     else:
         d["est_pe_latest"] = np.nan
 
-    # ── 價格推估區間（對應 Excel 昂貴/合理/便宜）────
-    # 計算基礎：3年平均現金股利（與 Excel 總表一致）
-    # 昂貴(4%) = 3年均股利 / 4%
-    # 合理(5.5%) = 3年均股利 / 5.5%
-    # 便宜(7%) = 3年均股利 / 7%
+    # ── 價格推估區間（昂貴4% / 合理5.5% / 便宜7%）──
     if not np.isnan(avg_div_3y) and avg_div_3y > 0:
         d["price_expensive"] = avg_div_3y / 0.04
         d["price_fair"]      = avg_div_3y / 0.055
@@ -396,9 +421,9 @@ def get_stock_data(stock_id: str, token: str) -> dict:
         df_rev["revenue"] = pd.to_numeric(df_rev["revenue"], errors="coerce")
         df_rev = df_rev.dropna(subset=["revenue"]).sort_values("date")
 
-        cur_year  = datetime.now().year
-        cur_df    = df_rev[df_rev["date"].dt.year == cur_year]
-        prev_df   = df_rev[df_rev["date"].dt.year == cur_year - 1]
+        cur_year = datetime.now().year
+        cur_df   = df_rev[df_rev["date"].dt.year == cur_year]
+        prev_df  = df_rev[df_rev["date"].dt.year == cur_year - 1]
 
         d["rev_ytd_yoy"] = np.nan
         if not cur_df.empty and not prev_df.empty:
@@ -409,11 +434,12 @@ def get_stock_data(stock_id: str, token: str) -> dict:
 
         d["rev_mom"] = np.nan
         if len(df_rev) >= 2:
-            c, p = df_rev.iloc[-1]["revenue"], df_rev.iloc[-2]["revenue"]
-            if p != 0:
-                d["rev_mom"] = (c - p) / p * 100
+            c_r = df_rev.iloc[-1]["revenue"]
+            p_r = df_rev.iloc[-2]["revenue"]
+            if p_r != 0:
+                d["rev_mom"] = (c_r - p_r) / p_r * 100
 
-        d["df_rev"] = df_rev   # 保留供明細顯示
+        d["df_rev"] = df_rev
     else:
         d["rev_ytd_yoy"] = np.nan
         d["rev_mom"]     = np.nan
@@ -423,17 +449,71 @@ def get_stock_data(stock_id: str, token: str) -> dict:
     return d
 
 
-# ─────────────────────────────────────────────────────
-# 批次篩選（輕量版）
-# ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
+# 批次掃描 ── 按鈕A 系列（24h 快取）
+# ═══════════════════════════════════════════════════════
 
-def calc_metrics_batch(stock_id, token):
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_top500_scan_pool(token: str) -> list:
+    """
+    抓取最近一個交易日全市場成交數據，取成交金額前500名個股。
+    排除所有 ETF（00開頭）、B/N結尾、含字母的權證。
+    24小時全域快取。
+    """
+    for days_back in range(1, 8):
+        target_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        try:
+            df, raw = finmind_get_no_id("TaiwanStockPrice", target_date, target_date, token)
+            if df.empty:
+                continue
+
+            df["stock_id"] = df["stock_id"].astype(str)
+            # 嚴格過濾：4碼純數字、首碼1~9（排除00開頭ETF）
+            valid_mask = (
+                df["stock_id"].str.match(r"^[1-9]\d{3}$") &
+                ~df["stock_id"].str.endswith("B") &
+                ~df["stock_id"].str.endswith("N")
+            )
+            df = df[valid_mask].copy()
+            if df.empty:
+                continue
+
+            close_col  = next((c for c in ["close", "Close", "closing_price"]
+                               if c in df.columns), None)
+            volume_col = next((c for c in ["Trading_Volume", "volume", "Volume"]
+                               if c in df.columns), None)
+
+            if close_col and volume_col:
+                df["_amount"] = (
+                    pd.to_numeric(df[close_col],  errors="coerce").fillna(0) *
+                    pd.to_numeric(df[volume_col], errors="coerce").fillna(0)
+                )
+            else:
+                num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                df["_amount"] = df[num_cols[0]] if num_cols else 0
+
+            top500 = (
+                df.sort_values("_amount", ascending=False)
+                .drop_duplicates("stock_id")
+                .head(500)["stock_id"]
+                .tolist()
+            )
+            if top500:
+                return top500
+        except Exception:
+            continue
+    return []
+
+
+def _calc_single_metrics(stock_id, token):
+    """輕量批次計算，供 batch_compute_all_metrics 呼叫"""
     price = get_price(stock_id)
 
     # 股利
     start_10y = (datetime.now() - timedelta(days=3650)).strftime("%Y-%m-%d")
     df_div, _ = finmind_get("TaiwanStockDividend", stock_id, start_10y, token)
-    div_yield, div_count, avg_eps_3y_b = np.nan, 0, np.nan
+    div_yield = avg_div_3y = np.nan
+    div_count = 0
 
     if not df_div.empty:
         df_div["_date"] = pd.to_datetime(df_div["date"])
@@ -443,18 +523,16 @@ def calc_metrics_batch(stock_id, token):
         if not np.isnan(price) and price > 0 and cash_sum > 0:
             div_yield = cash_sum / price
         div_count = int((df_div["_cash"] > 0).sum())
-        # 3年均股利
-        df_yr = df_div[df_div["_cash"] > 0].copy()
+
+        df_yr  = df_div[df_div["_cash"] > 0].copy()
         df_yr["_yr"] = df_yr["_date"].dt.year
         yr_sum = df_yr.groupby("_yr")["_cash"].sum()
-        avg_div_3y_b = yr_sum.tail(3).mean() if not yr_sum.empty else np.nan
-    else:
-        avg_div_3y_b = np.nan
+        avg_div_3y = float(yr_sum.tail(3).mean()) if not yr_sum.empty else np.nan
 
     # 月營收
     start_rev = (datetime.now() - timedelta(days=760)).strftime("%Y-%m-%d")
     df_rev, _ = finmind_get("TaiwanStockMonthRevenue", stock_id, start_rev, token)
-    ytd, mom  = np.nan, np.nan
+    ytd = mom = np.nan
     if not df_rev.empty:
         df_rev["date"]    = pd.to_datetime(df_rev["date"])
         df_rev["revenue"] = pd.to_numeric(df_rev["revenue"], errors="coerce")
@@ -468,37 +546,108 @@ def calc_metrics_batch(stock_id, token):
             if not ps.empty and ps["revenue"].sum() != 0:
                 ytd = (cur_df["revenue"].sum() / ps["revenue"].sum() - 1) * 100
         if len(df_rev) >= 2:
-            c, p = df_rev.iloc[-1]["revenue"], df_rev.iloc[-2]["revenue"]
-            if p != 0:
-                mom = (c - p) / p * 100
+            c_r = df_rev.iloc[-1]["revenue"]
+            p_r = df_rev.iloc[-2]["revenue"]
+            if p_r != 0:
+                mom = (c_r - p_r) / p_r * 100
 
     # EPS
     start_eps = (datetime.now() - timedelta(days=1100)).strftime("%Y-%m-%d")
     df_eps, _ = finmind_get("TaiwanStockFinancialStatements", stock_id, start_eps, token)
-    eps_yoy, est_yield = np.nan, np.nan
+    eps_yoy = est_yield = avg_eps_3y = np.nan
     if not df_eps.empty and "type" in df_eps.columns:
         e = df_eps[df_eps["type"] == "EPS"][["date", "value"]].copy()
         e["value"] = pd.to_numeric(e["value"], errors="coerce")
         e["date"]  = pd.to_datetime(e["date"])
         e = e.dropna().sort_values("date").drop_duplicates("date")
         if len(e) >= 8:
-            eps_yoy = e.tail(4)["value"].sum() / e.iloc[-8:-4]["value"].sum() \
-                      if e.iloc[-8:-4]["value"].sum() != 0 else np.nan
+            s1 = e.tail(4)["value"].sum()
+            s2 = e.iloc[-8:-4]["value"].sum()
+            eps_yoy = s1 / s2 if s2 != 0 else np.nan
         e_yr = e.groupby(e["date"].dt.year)["value"].sum()
-        avg_eps_3y_b = e_yr.tail(3).mean() if not e_yr.empty else np.nan
-        if not np.isnan(avg_eps_3y_b) and avg_eps_3y_b > 0 and not np.isnan(price) and price > 0:
-            payout = min(avg_div_3y_b / avg_eps_3y_b, 1.5) \
-                     if not np.isnan(avg_div_3y_b) and avg_eps_3y_b > 0 else 0.6
-            est_yield = (avg_eps_3y_b * payout) / price
+        avg_eps_3y = float(e_yr.tail(3).mean()) if not e_yr.empty else np.nan
+        if (not np.isnan(avg_eps_3y) and avg_eps_3y > 0
+                and not np.isnan(price) and price > 0):
+            payout = (min(avg_div_3y / avg_eps_3y, 1.5)
+                      if not np.isnan(avg_div_3y) and avg_eps_3y > 0 else 0.6)
+            est_yield = (avg_eps_3y * payout) / price
 
-    return div_yield, div_count, ytd, mom, eps_yoy, est_yield
+    return {
+        "price":       price,
+        "div_yield":   div_yield,
+        "div_count":   div_count,
+        "rev_ytd_yoy": ytd,
+        "rev_mom":     mom,
+        "eps_yoy":     eps_yoy,
+        "est_yield":   est_yield,
+        "avg_div_3y":  avg_div_3y,
+        "avg_eps_3y":  avg_eps_3y,
+    }
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def batch_compute_all_metrics(stock_ids: tuple, token: str) -> pd.DataFrame:
+    """
+    按鈕A 的核心：對整個掃描池預算所有指標，結果快取24小時。
+    回傳 DataFrame，按鈕B 直接對此 DataFrame 做本地過濾。
+    """
+    results = []
+    progress = st.progress(0, text="⏳ 預算市場數據中...")
+    total = len(stock_ids)
+
+    for i, sid in enumerate(stock_ids):
+        progress.progress((i + 1) / total,
+                          text=f"預算指標：{sid}（{i+1}/{total}）")
+        try:
+            m = _calc_single_metrics(sid, token)
+            results.append({
+                "代號":              sid,
+                "股價":              m["price"],
+                "殖利率(%)":         round(m["div_yield"] * 100, 2) if not np.isnan(m["div_yield"]) else np.nan,
+                "10年股利次數":       m["div_count"],
+                "累計營收年增率(%)":  round(m["rev_ytd_yoy"], 2) if not np.isnan(m["rev_ytd_yoy"]) else np.nan,
+                "營收與前月比(%)":    round(m["rev_mom"], 2)       if not np.isnan(m["rev_mom"]) else np.nan,
+                "EPS年度比較":        round(m["eps_yoy"], 4)       if not np.isnan(m["eps_yoy"]) else np.nan,
+                "EPS推隔年殖利率(%)": round(m["est_yield"] * 100, 2) if not np.isnan(m["est_yield"]) else np.nan,
+                "3年平均股利":        round(m["avg_div_3y"], 2)    if not np.isnan(m["avg_div_3y"]) else np.nan,
+                "3年平均EPS":         round(m["avg_eps_3y"], 2)    if not np.isnan(m["avg_eps_3y"]) else np.nan,
+            })
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+    progress.empty()
+    cols = ["代號","股價","殖利率(%)","10年股利次數",
+            "累計營收年增率(%)","營收與前月比(%)","EPS年度比較",
+            "EPS推隔年殖利率(%)","3年平均股利","3年平均EPS"]
+    return pd.DataFrame(results, columns=cols) if results else pd.DataFrame(columns=cols)
+
+
+def local_filter(df: pd.DataFrame,
+                 min_yield, min_div_count, min_rev_ytd_yoy,
+                 min_rev_mom, min_eps_yoy, min_eps_est_yield) -> pd.DataFrame:
+    """按鈕B：僅對快取 DataFrame 做本地過濾，0 API 額度。"""
+    mask = pd.Series([True] * len(df), index=df.index)
+    if min_yield > -1:
+        mask &= df["殖利率(%)"].notna() & (df["殖利率(%)"] >= min_yield)
+    if min_div_count > -1:
+        mask &= df["10年股利次數"] >= min_div_count
+    if min_rev_ytd_yoy > -100:
+        mask &= df["累計營收年增率(%)"].notna() & (df["累計營收年增率(%)"] >= min_rev_ytd_yoy)
+    if min_rev_mom > -100:
+        mask &= df["營收與前月比(%)"].notna() & (df["營收與前月比(%)"] >= min_rev_mom)
+    if min_eps_yoy > -1:
+        mask &= df["EPS年度比較"].notna() & (df["EPS年度比較"] >= min_eps_yoy)
+    if min_eps_est_yield > -1:
+        mask &= df["EPS推隔年殖利率(%)"].notna() & (df["EPS推隔年殖利率(%)"] >= min_eps_est_yield)
+    return df[mask].sort_values("殖利率(%)", ascending=False).reset_index(drop=True)
+
+
+# ═══════════════════════════════════════════════════════
+# 股票清單（全市場，供 Tab2 搜尋）
+# ═══════════════════════════════════════════════════════
 
 def get_tw_stock_list(token):
-    """
-    回傳全市場台股 (stock_id, label) 清單（含名稱）。
-    用於個股儀表板搜尋選單（全市場，不限縮）。
-    """
     try:
         params = {"dataset": "TaiwanStockInfo"}
         if token:
@@ -508,16 +657,14 @@ def get_tw_stock_list(token):
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
             df["stock_id"] = df["stock_id"].astype(str)
-            # 4~5碼數字：上市上櫃個股 + ETF（00878等），排除債券ETF(B結尾)、ETN(N結尾)、權證
-            # 純個股過濾：只保留 4 碼純數字個股
-            # 排除：00開頭(ETF)、B結尾(債券ETF)、N結尾(ETN)、含字母(權證/可轉債)
             mask = (
-                df["stock_id"].str.match(r"^[1-9]\d{3}$") &   # 嚴格4碼，首碼1~9（排除00開頭）
-                ~df["stock_id"].str.endswith("B") &              # 排除債券ETF
-                ~df["stock_id"].str.endswith("N")                # 排除ETN
+                df["stock_id"].str.match(r"^[1-9]\d{3}$") &
+                ~df["stock_id"].str.endswith("B") &
+                ~df["stock_id"].str.endswith("N")
             )
             df = df[mask].copy()
-            name_col = next((c for c in ["stock_name", "name", "Name"] if c in df.columns), None)
+            name_col = next((c for c in ["stock_name", "name", "Name"]
+                             if c in df.columns), None)
             if name_col:
                 df["_label"] = df["stock_id"] + "  " + df[name_col].fillna("")
             else:
@@ -530,83 +677,7 @@ def get_tw_stock_list(token):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_top500_scan_pool(token: str) -> list:
-    """
-    抓取前一交易日全市場成交數據（TaiwanStockPrice），
-    計算「成交金額 = 成交量 × 收盤價」，取前 500 名。
-
-    篩選規則（對應需求）：
-      ✅ 保留：4碼個股、重要 ETF（00878等5碼數字）
-      ❌ 排除：債券ETF（B結尾）、ETN（N結尾）、權證（含英文字母且非ETF）
-
-    回傳：已排序的股票代號清單（成交金額由大到小）
-    """
-    # 往前找最近5個交易日，確保抓到有資料的日期
-    for days_back in range(1, 8):
-        target_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        try:
-            params = {
-                "dataset": "TaiwanStockPrice",
-                "start_date": target_date,
-                "end_date": target_date,
-            }
-            if token:
-                params["token"] = token
-            r = requests.get(FINMIND_BASE, params=params, timeout=30)
-            data = r.json()
-            if data.get("status") == 200 and data.get("data"):
-                df = pd.DataFrame(data["data"])
-                if df.empty:
-                    continue
-
-                df["stock_id"] = df["stock_id"].astype(str)
-
-                # 篩選有效代號
-                # 純個股過濾：只保留 4 碼純數字個股
-                # 排除：00開頭(ETF/ETN)、B結尾(債券ETF)、N結尾(ETN)、含字母(權證)
-                valid_mask = (
-                    df["stock_id"].str.match(r"^[1-9]\d{3}$") &       # 嚴格4碼，首碼1~9
-                    ~df["stock_id"].str.endswith("B") &                 # 排除債券ETF
-                    ~df["stock_id"].str.endswith("N")                   # 排除ETN
-                )
-                df = df[valid_mask].copy()
-
-                # 計算成交金額（volume × close_price）
-                close_col  = next((c for c in ["close", "Close", "closing_price"] if c in df.columns), None)
-                volume_col = next((c for c in ["Trading_Volume", "volume", "Volume"] if c in df.columns), None)
-
-                if close_col and volume_col:
-                    df["_amount"] = (
-                        pd.to_numeric(df[close_col],  errors="coerce").fillna(0) *
-                        pd.to_numeric(df[volume_col], errors="coerce").fillna(0)
-                    )
-                else:
-                    # 欄位找不到，改用成交筆數或直接排序
-                    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-                    df["_amount"] = df[num_cols[0]] if num_cols else 0
-
-                # 取前 500（依成交金額降序）
-                top500 = (
-                    df.sort_values("_amount", ascending=False)
-                    .drop_duplicates("stock_id")
-                    .head(500)["stock_id"]
-                    .tolist()
-                )
-                return top500  # 找到資料就返回，不繼續往前找
-        except Exception:
-            continue
-    return []  # 所有日期都失敗時回傳空清單
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
 def load_stock_options(token: str):
-    """
-    啟動時快取完整股票清單（全市場），供個股搜尋使用。
-    回傳：
-      labels   : ["2330  台積電", "2882  國泰金", ...]  ← selectbox 用
-      label2id : {"2330  台積電": "2330", ...}          ← 反查代號用
-      id_list  : ["2330", "2882", ...]                  ← 全市場代號（備用）
-    """
     pairs = get_tw_stock_list(token)
     if not pairs:
         return [], {}, []
@@ -616,48 +687,14 @@ def load_stock_options(token: str):
     return labels, label2id, id_list
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def run_screening(min_yield, min_div_count, min_rev_ytd_yoy, min_rev_mom,
-                  min_eps_yoy, min_eps_est_yield, token, stock_ids):
-    results = []
-    progress = st.progress(0, text="開始掃描...")
-    total = len(stock_ids)
-    for i, sid in enumerate(stock_ids):
-        progress.progress((i + 1) / total, text=f"分析中：{sid}（{i+1}/{total}）")
-        try:
-            dy, dc, ytd, mom, ey, eey = calc_metrics_batch(sid, token)
-            ok = True
-            if min_yield > -1         and (np.isnan(dy)  or dy * 100 < min_yield):             ok = False
-            if min_div_count > -1     and dc < min_div_count:                                   ok = False
-            if min_rev_ytd_yoy > -100 and (np.isnan(ytd) or ytd < min_rev_ytd_yoy):            ok = False
-            if min_rev_mom > -100     and (np.isnan(mom) or mom < min_rev_mom):                 ok = False
-            if min_eps_yoy > -1       and (np.isnan(ey)  or ey  < min_eps_yoy):                ok = False
-            if min_eps_est_yield > -1 and (np.isnan(eey) or eey * 100 < min_eps_est_yield):     ok = False
-            if ok:
-                results.append({
-                    "代號":              sid,
-                    "殖利率(%)":         round(dy * 100, 2)  if not np.isnan(dy)  else None,
-                    "10年股利次數":       dc,
-                    "累計營收年增率(%)":  round(ytd, 2)       if not np.isnan(ytd) else None,
-                    "營收與前月比(%)":    round(mom, 2)       if not np.isnan(mom) else None,
-                    "EPS年度比較":        round(ey, 4)        if not np.isnan(ey)  else None,
-                    "EPS推隔年殖利率(%)": round(eey * 100, 2) if not np.isnan(eey) else None,
-                })
-        except Exception:
-            pass
-        time.sleep(0.25)
-    progress.empty()
-    cols = ["代號","殖利率(%)","10年股利次數","累計營收年增率(%)","營收與前月比(%)","EPS年度比較","EPS推隔年殖利率(%)"]
-    return pd.DataFrame(results) if results else pd.DataFrame(columns=cols)
-
-
-# ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
 # 側邊欄
-# ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════
 with st.sidebar:
     st.header("⚙️ 篩選條件")
     st.caption("對應 Excel「總表 2」第一列")
     st.divider()
+
     min_yield         = st.number_input("殖利率 ≥ (%)",         min_value=-1.0,   max_value=100.0, value=5.0,    step=0.5,  help="-1=不篩選")
     min_div_count     = st.number_input("10年股利次數 ≥",        min_value=-1,     max_value=40,    value=9,      step=1,    help="-1=不篩選")
     min_rev_ytd_yoy   = st.number_input("累計營收年增率 ≥ (%)",  min_value=-100.0, max_value=200.0, value=-100.0, step=5.0,  help="-100=不篩選")
@@ -665,25 +702,35 @@ with st.sidebar:
     min_eps_yoy       = st.number_input("EPS年度比較 ≥",         min_value=-1.0,   max_value=5.0,   value=0.7,    step=0.05, help="-1=不篩選")
     min_eps_est_yield = st.number_input("EPS推隔年殖利率 ≥ (%)", min_value=-1.0,   max_value=30.0,  value=6.0,    step=0.5,  help="-1=不篩選")
     st.divider()
+
     if _SECRET_TOKEN:
         finmind_token = _SECRET_TOKEN
         st.success("✅ Token 已從 Secrets 載入", icon="🔑")
     else:
         finmind_token = st.text_input("FinMind Token（選填）", type="password")
+
     max_stocks = st.slider("掃描上限（支）", 20, 500, 100, 20)
     st.divider()
-    run_btn = st.button("🚀 RUN 篩選", use_container_width=True, type="primary")
+
+    # ── 雙按鈕 ─────────────────────────────────────────
+    st.markdown("**市場數據操作**")
+    update_btn = st.button("🔄 更新市場數據", use_container_width=True, type="primary",
+                           help="抓取成交前500個股並預算所有指標（24h快取）")
+    filter_btn = st.button("🎯 執行條件篩選", use_container_width=True,
+                           help="對快取數據本地過濾，不耗API額度")
+    st.divider()
+    st.caption("⚠️ 數據僅供參考，不構成投資建議")
 
 
 # ─────────────────────────────────────────────────────
 # 主頁面
 # ─────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["📊 批次篩選（RUN）", "🔍 個股儀表板", "🛠 API 診斷"])
+tab1, tab2, tab3 = st.tabs(["📊 批次篩選", "🔍 個股儀表板", "🛠 API 診斷"])
 
 
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 # Tab1：批次篩選
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 with tab1:
     st.title("📊 批次篩選")
     st.markdown("""
@@ -696,65 +743,133 @@ with tab1:
 | EPS年度比較 | ≥ 門檻 | 0.7 |
 | EPS推隔年殖利率 | ≥ 門檻 | 6% |
 """)
-    if run_btn:
+
+    # ── Session State 管理快取 DataFrame ──────────────
+    if "market_df" not in st.session_state:
+        st.session_state["market_df"]        = pd.DataFrame()
+        st.session_state["market_pool_size"] = 0
+        st.session_state["market_updated"]   = None
+
+    # ── 按鈕A：更新市場數據 ───────────────────────────
+    if update_btn:
         with st.spinner("🔍 抓取市場成交排行，建立掃描池..."):
             top500 = get_top500_scan_pool(finmind_token)
-            if top500:
-                # 成交金額前500，依使用者設定的上限截取
-                stock_sample = top500[:max_stocks]
-                st.success(
-                    f"📊 掃描池：成交金額前 {len(top500)} 名中，取前 **{len(stock_sample)}** 支"
-                    f"（已排除債券ETF、ETN、殭屍股）"
-                )
-            else:
-                # API 失敗時 fallback 到全市場清單
-                _, __, all_ids = load_stock_options(finmind_token)
-                if not all_ids:
-                    all_ids = [str(i) for i in range(1101, 3700)] + [str(i) for i in range(4100, 6900)]
-                stock_sample = all_ids[:max_stocks]
-                st.warning(f"⚠️ 無法取得成交排行，改用全市場清單（前 {len(stock_sample)} 支）")
-        st.info(f"開始掃描 {len(stock_sample)} 支，約需 {len(stock_sample)//4} 秒...")
-        result_df = run_screening(
-            min_yield, min_div_count, min_rev_ytd_yoy, min_rev_mom,
-            min_eps_yoy, min_eps_est_yield, finmind_token, tuple(stock_sample)
-        )
-        if result_df.empty:
-            st.warning("無符合條件的股票，請嘗試放寬門檻。")
+
+        if top500:
+            stock_sample = tuple(top500[:max_stocks])
+            st.success(
+                f"📊 掃描池：成交金額前 {len(top500)} 名中，取前 **{len(stock_sample)}** 支"
+                "（已排除 ETF / 權證）"
+            )
         else:
-            st.success(f"✅ 共 **{len(result_df)}** 支通過篩選")
-            st.dataframe(result_df, use_container_width=True, hide_index=True)
-            st.download_button("⬇️ 下載 CSV",
-                result_df.to_csv(index=False, encoding="utf-8-sig"), "result.csv", "text/csv")
+            _, __, all_ids = load_stock_options(finmind_token)
+            if not all_ids:
+                all_ids = [str(i) for i in range(1101, 3700)] + [str(i) for i in range(4100, 6900)]
+            stock_sample = tuple(all_ids[:max_stocks])
+            st.warning(f"⚠️ 無法取得成交排行，改用全市場清單（前 {len(stock_sample)} 支）")
+
+        st.info(f"🔄 開始預算 {len(stock_sample)} 支個股指標，約需 {len(stock_sample) // 5} 秒...")
+
+        with st.spinner("預算所有指標中（24h快取）..."):
+            mdf = batch_compute_all_metrics(stock_sample, finmind_token)
+
+        st.session_state["market_df"]        = mdf
+        st.session_state["market_pool_size"] = len(stock_sample)
+        st.session_state["market_updated"]   = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        st.success(f"✅ 完成！共預算 **{len(mdf)}** 支，已快取24小時。"
+                   f"請點「🎯 執行條件篩選」查看結果。")
+
+    # ── 按鈕B：執行條件篩選（純本地，0 API）─────────
+    if filter_btn:
+        mdf = st.session_state.get("market_df", pd.DataFrame())
+        if mdf.empty:
+            st.warning("⚠️ 尚無快取數據，請先點「🔄 更新市場數據」。")
+        else:
+            updated_at = st.session_state.get("market_updated", "—")
+            pool_size  = st.session_state.get("market_pool_size", 0)
+            st.caption(f"📦 快取池：{pool_size} 支 ｜ 更新時間：{updated_at}")
+
+            result_df = local_filter(
+                mdf, min_yield, min_div_count, min_rev_ytd_yoy,
+                min_rev_mom, min_eps_yoy, min_eps_est_yield
+            )
+
+            if result_df.empty:
+                st.warning("無符合條件的股票，請嘗試放寬門檻。")
+            else:
+                st.success(f"✅ 共 **{len(result_df)}** 支通過篩選（本地過濾，0 API 額度）")
+                st.dataframe(result_df, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "⬇️ 下載 CSV",
+                    result_df.to_csv(index=False, encoding="utf-8-sig"),
+                    "result.csv", "text/csv"
+                )
+
+    # ── 顯示目前快取狀況 ──────────────────────────────
+    if (not update_btn and not filter_btn
+            and not st.session_state.get("market_df", pd.DataFrame()).empty):
+        updated_at = st.session_state.get("market_updated", "—")
+        pool_size  = st.session_state.get("market_pool_size", 0)
+        st.info(
+            f"💾 已有快取數據（{pool_size} 支，更新於 {updated_at}）。"
+            "點「🎯 執行條件篩選」立即過濾，或「🔄 更新市場數據」重新抓取。"
+        )
 
 
-# ══════════════════════════════════════════════════════
-# Tab2：個股儀表板
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
+# Tab2：個股儀表板（三步驟搜尋）
+# ═══════════════════════════════════════════════════════
 with tab2:
     st.title("🔍 個股儀表板")
 
-    # ── 啟動時載入完整股票清單（快取，不重複請求）────────────
+    # ── 啟動時載入完整股票清單 ────────────────────────
     with st.spinner("載入股票清單..."):
         _labels, _label2id, _id_list = load_stock_options(finmind_token)
 
-    if _labels:
-        # st.selectbox 支援鍵盤輸入即時過濾，在手機/桌面都能搜尋
-        # 使用者輸入「國泰」→ 自動列出含「國泰」的所有選項
-        selected_label = st.selectbox(
-            "搜尋股票（輸入代號或名稱關鍵字）",
-            options=[""] + _labels,          # 第一項空白 = 未選取
-            index=0,
-            placeholder="輸入代號或關鍵字，例如：2882 或 國泰",
-            key="stock_selectbox",
-        )
-        sid = _label2id.get(selected_label, "").strip() if selected_label else ""
-    else:
-        # FinMind 無法取得清單時，退回手動輸入
-        st.warning("⚠️ 無法載入股票清單（FinMind API 限流或無 Token），請手動輸入代號")
-        manual = st.text_input("手動輸入股票代號", placeholder="例如：2882", key="stock_manual")
-        sid = manual.strip()
+    # ══ 三步驟搜尋 ════════════════════════════════════
+    # Step 1：輸入關鍵字
+    keyword = st.text_input(
+        "① 輸入代號或名稱關鍵字",
+        placeholder="例如：2882 或 國泰",
+        key="stock_kw",
+    )
 
-    # 有選到股票就立即查詢（不需按鈕，選即查）
+    sid = ""  # 最終確認的股票代號
+
+    if keyword.strip():
+        kw = keyword.strip()
+
+        # Step 2：列出包含關鍵字的選項
+        if _labels:
+            matched = [lb for lb in _labels if kw in lb]
+        else:
+            matched = []
+
+        if not matched:
+            # 若完全匹配代號（4碼數字），直接接受
+            if kw.isdigit() and len(kw) == 4:
+                matched = [kw]
+            else:
+                st.warning(f"找不到包含「{kw}」的股票，請確認代號或名稱。")
+
+        if matched:
+            selected_label = st.selectbox(
+                f"② 搜尋結果（共 {len(matched)} 筆），請選取目標：",
+                options=[""] + matched,
+                index=0,
+                key="stock_select",
+            )
+
+            # Step 3：確認執行
+            confirm_btn = st.button("✅ 確認執行", type="primary", key="confirm_stock")
+
+            if selected_label and confirm_btn:
+                sid = _label2id.get(selected_label, selected_label.split()[0]).strip()
+            elif confirm_btn and not selected_label:
+                st.warning("請先選擇一支股票。")
+
+    # ── 個股儀表板主體 ────────────────────────────────
     if sid:
         with st.spinner(f"正在抓取 {sid} 數據..."):
             d = get_stock_data(sid, finmind_token)
@@ -762,39 +877,37 @@ with tab2:
         price   = d.get("price", np.nan)
         company = d.get("company", sid)
 
-        # ── 標題 ──────────────────────────────────────
         st.markdown(f"## {sid}・{company}")
         st.caption(d.get("industry", ""))
 
-        # ══ 股價走勢圖（一年，手機可視） ══════════════
+        # ══ 近一年股價走勢圖 ══════════════════════════
         section("📉 近一年股價走勢")
         price_hist = d.get("price_hist", pd.DataFrame())
         if not price_hist.empty:
-            # 標記最高/最低點
             max_p = price_hist["收盤價"].max()
             min_p = price_hist["收盤價"].min()
             now_p = price_hist["收盤價"].iloc[-1] if not price_hist.empty else np.nan
             pct_from_low  = (now_p - min_p) / min_p * 100 if min_p > 0 else np.nan
             pct_from_high = (now_p - max_p) / max_p * 100 if max_p > 0 else np.nan
 
-            # 三欄顯示高低點資訊
             sc1, sc2, sc3 = st.columns(3)
-            sc1.metric("52週最高", f"{max_p:.1f}", delta=None)
-            sc2.metric("52週最低", f"{min_p:.1f}", delta=None)
-            sc3.metric("距最低",
-                       f"+{pct_from_low:.1f}%" if not np.isnan(pct_from_low) else "N/A",
-                       delta=f"{pct_from_high:.1f}% (距最高)" if not np.isnan(pct_from_high) else None)
+            sc1.metric("52週最高", f"{max_p:.1f}")
+            sc2.metric("52週最低", f"{min_p:.1f}")
+            sc3.metric(
+                "距最低",
+                f"+{pct_from_low:.1f}%" if not np.isnan(pct_from_low) else "N/A",
+                delta=f"{pct_from_high:.1f}% (距最高)" if not np.isnan(pct_from_high) else None
+            )
 
             st.line_chart(price_hist, height=220, use_container_width=True)
 
-            # 便宜/合理/昂貴參考線說明
             pe_chp  = d.get("price_cheap", np.nan)
-            pe_fair = d.get("price_fair", np.nan)
+            pe_fair = d.get("price_fair",  np.nan)
             pe_exp  = d.get("price_expensive", np.nan)
             if not np.isnan(pe_chp):
                 st.caption(
-                    f"💚 便宜價 {pe_chp:.1f}　　🟡 合理價 {pe_fair:.1f}　　🔴 昂貴價 {pe_exp:.1f}　　"
-                    f"（基準：3年均股利 {fmt(d.get('avg_div_3y', np.nan))} 元）"
+                    f"💚 便宜價 {pe_chp:.1f}　　🟡 合理價 {pe_fair:.1f}　　🔴 昂貴價 {pe_exp:.1f}"
+                    f"　　（基準：3年均股利 {fmt(d.get('avg_div_3y', np.nan))} 元）"
                 )
         else:
             st.info("無法取得歷史股價，請確認股票代號格式（如：2330、2882）")
@@ -802,19 +915,18 @@ with tab2:
         # ══ 即時行情 ══════════════════════════════════
         section("📡 即時行情")
 
-        # 判斷價格區間
-        pe_chp  = d.get("price_cheap", np.nan)
-        pe_fair = d.get("price_fair", np.nan)
+        pe_chp  = d.get("price_cheap",     np.nan)
+        pe_fair = d.get("price_fair",      np.nan)
         pe_exp  = d.get("price_expensive", np.nan)
         if not np.isnan(price) and not np.isnan(pe_chp):
             if price <= pe_chp:
-                zone, zone_color = "✅ 便宜區", "green"
+                zone, zone_color = "✅ 便宜區",   "green"
             elif price <= pe_fair:
                 zone, zone_color = "🟡 合理偏低區", "green"
             elif price <= pe_exp:
                 zone, zone_color = "🟠 合理偏高區", "gold"
             else:
-                zone, zone_color = "🔴 昂貴區", "red"
+                zone, zone_color = "🔴 昂貴區",   "red"
         else:
             zone, zone_color = "—", "blue"
 
@@ -832,11 +944,13 @@ with tab2:
         with c4:
             ytd_val = d.get("rev_ytd_yoy", np.nan)
             col = "green" if (not np.isnan(ytd_val) and ytd_val >= 0) else "red"
-            st.markdown(card("累積營收年增率", fmt(ytd_val, 2, "%"), sub="今年累積 vs 去年同期", color=col), unsafe_allow_html=True)
+            st.markdown(card("累積營收年增率", fmt(ytd_val, 2, "%"),
+                             sub="今年累積 vs 去年同期", color=col), unsafe_allow_html=True)
         with c5:
             mom_val = d.get("rev_mom", np.nan)
             col = "green" if (not np.isnan(mom_val) and mom_val >= 0) else "red"
-            st.markdown(card("營收與前月比", fmt(mom_val, 2, "%"), sub="最新月 vs 上月", color=col), unsafe_allow_html=True)
+            st.markdown(card("營收與前月比", fmt(mom_val, 2, "%"),
+                             sub="最新月 vs 上月", color=col), unsafe_allow_html=True)
 
         # ══ 股利政策 ══════════════════════════════════
         section("💰 股利政策（當年度）")
@@ -889,7 +1003,8 @@ with tab2:
         with c20:
             ey_val = d.get("eps_yoy", np.nan)
             ey_col = "green" if (not np.isnan(ey_val) and ey_val >= 1) else "red"
-            st.markdown(card("EPS年度比較", fmt(ey_val, 4), sub="近4季/前4季（≥1=成長）", color=ey_col), unsafe_allow_html=True)
+            st.markdown(card("EPS年度比較", fmt(ey_val, 4),
+                             sub="近4季/前4季（≥1=成長）", color=ey_col), unsafe_allow_html=True)
 
         # ══ 價格推估 ══════════════════════════════════
         section("🏷️ 價格推估（以3年平均股利 / 殖利率反推）")
@@ -905,15 +1020,15 @@ with tab2:
             st.markdown(card("便宜（7%）", fmt(d.get("price_cheap"), 1),
                              sub=f"3年均股利{fmt(d.get('avg_div_3y'))}÷7%", color="green"), unsafe_allow_html=True)
 
-        # ══ 未來展望推估（截圖紅字重點） ══════════════
+        # ══ 未來展望推估（對應 Excel 紅字欄位）══════
         section("🔮 未來展望推估（對應 Excel 紅字欄位）")
 
-        ea  = d.get("est_yield_avg", np.nan)
+        ea  = d.get("est_yield_avg",    np.nan)
         el  = d.get("est_yield_latest", np.nan)
-        epa = d.get("est_pe_avg", np.nan)
-        epl = d.get("est_pe_latest", np.nan)
-        ae  = d.get("avg_eps_3y", np.nan)
-        p3y = d.get("payout_3y", np.nan)
+        epa = d.get("est_pe_avg",       np.nan)
+        epl = d.get("est_pe_latest",    np.nan)
+        ae  = d.get("avg_eps_3y",       np.nan)
+        p3y = d.get("payout_3y",        np.nan)
 
         f1, f2 = st.columns(2)
         with f1:
@@ -951,7 +1066,7 @@ with tab2:
 
         # 推估股價區間（以推估股利反推）
         st.markdown("**📌 以推估EPS計算的股價參考區間：**")
-        if not np.isnan(ae) and not np.isnan(p3y):
+        if not np.isnan(ae) and not np.isnan(p3y) and ae > 0:
             est_div = ae * p3y
             fc1, fc2, fc3 = st.columns(3)
             with fc1:
@@ -963,6 +1078,8 @@ with tab2:
             with fc3:
                 st.markdown(card("推估便宜（7%）", fmt(est_div / 0.07, 1),
                                  sub=f"推估股利{fmt(est_div)}÷7%", color="green"), unsafe_allow_html=True)
+        else:
+            st.info("EPS或配息率資料不足，無法推估股價區間")
 
         # ── 摺疊明細 ──────────────────────────────────
         with st.expander("📋 股利明細（近10年）"):
@@ -970,31 +1087,38 @@ with tab2:
             if not df_div_show.empty:
                 df_div_show = df_div_show.copy()
                 df_div_show["現金股利合計"] = extract_cash_dividend(df_div_show)
-                base_cols = ["date", "year", "現金股利合計"]
-                extra_cols = [c for c in ["CashEarningsDistribution", "CashStatutorySurplus",
-                               "StockEarningsDistribution", "CashExDividendTradingDate",
-                               "CashDividendPaymentDate"] if c in df_div_show.columns]
-                show_cols = base_cols + extra_cols
-                st.dataframe(df_div_show[show_cols].sort_values("date", ascending=False),
-                             use_container_width=True, hide_index=True)
+                base_cols  = [c for c in ["date", "year", "現金股利合計"] if c in df_div_show.columns or c == "現金股利合計"]
+                extra_cols = [c for c in [
+                    "CashEarningsDistribution", "CashStatutorySurplus",
+                    "StockEarningsDistribution", "CashExDividendTradingDate",
+                    "CashDividendPaymentDate"
+                ] if c in df_div_show.columns]
+                show_cols = [c for c in base_cols + extra_cols if c in df_div_show.columns or c == "現金股利合計"]
+                st.dataframe(
+                    df_div_show.assign(**{"現金股利合計": df_div_show["現金股利合計"]})[show_cols]
+                    .sort_values("date", ascending=False),
+                    use_container_width=True, hide_index=True
+                )
             else:
                 st.info("無股利資料")
 
         with st.expander("📋 月營收明細（近2年）"):
             df_rev_show = d.get("df_rev", pd.DataFrame())
             if not df_rev_show.empty:
-                st.dataframe(df_rev_show.sort_values("date", ascending=False).head(24),
-                             use_container_width=True, hide_index=True)
+                st.dataframe(
+                    df_rev_show.sort_values("date", ascending=False).head(24),
+                    use_container_width=True, hide_index=True
+                )
             else:
                 st.info("無月營收資料")
 
-    elif not sid:
-        st.info("👆 請在上方搜尋並選擇股票")
+    elif not keyword.strip():
+        st.info("👆 請在上方輸入股票代號或名稱關鍵字搜尋")
 
 
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 # Tab3：API 診斷
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════
 with tab3:
     st.title("🛠 API 診斷")
     st.markdown("**出現 N/A 請先在此診斷，確認 FinMind API 實際回傳的欄位名稱與資料內容。**")
@@ -1022,10 +1146,12 @@ with tab3:
             st.success(f"✅ {len(df2)} 筆")
             st.write("**實際欄位：**", list(df2.columns))
             df2["_自動偵測現金股利"] = extract_cash_dividend(df2)
+            preview_cols = ["date"] + [c for c in [
+                "year", "_自動偵測現金股利",
+                "CashEarningsDistribution", "CashStatutorySurplus",
+                "cash_dividend", "stock_or_cash"
+            ] if c in df2.columns or c == "_自動偵測現金股利"]
             st.write("**自動偵測結果（前5筆）：**")
-            preview_cols = ["date"] + [c for c in ["year","_自動偵測現金股利",
-                "CashEarningsDistribution","CashStatutorySurplus","cash_dividend",
-                "stock_or_cash"] if c in df2.columns or c == "_自動偵測現金股利"]
             st.dataframe(df2[preview_cols].head(5), use_container_width=True)
         else:
             st.error("❌ 無資料")
@@ -1038,7 +1164,8 @@ with tab3:
             st.success(f"✅ {len(df3)} 筆 ｜ 欄位：{list(df3.columns)}")
             st.dataframe(df3.head(5), use_container_width=True)
         else:
-            st.error("❌ 無資料"); st.json(raw3)
+            st.error("❌ 無資料")
+            st.json(raw3)
 
         st.markdown("### 4️⃣ TaiwanStockFinancialStatements（EPS）")
         start_eps = (datetime.now() - timedelta(days=1100)).strftime("%Y-%m-%d")
@@ -1050,7 +1177,8 @@ with tab3:
                 st.write("type 唯一值：", df4["type"].unique().tolist())
                 st.dataframe(df4[df4["type"] == "EPS"].head(8), use_container_width=True)
         else:
-            st.error("❌ 無資料"); st.json(raw4)
+            st.error("❌ 無資料")
+            st.json(raw4)
 
         st.markdown("### 5️⃣ 完整指標計算結果")
         with st.spinner("計算中..."):
@@ -1058,26 +1186,45 @@ with tab3:
 
         rows = [
             ("股價",                  fmt(d_diag.get("price"))),
-            ("殖利率",                f"{d_diag['div_yield']*100:.2f}%" if not np.isnan(d_diag.get("div_yield", np.nan)) else "❌"),
+            ("殖利率",                f"{d_diag['div_yield']*100:.2f}%"
+                                      if not np.isnan(d_diag.get("div_yield", np.nan)) else "❌"),
             ("配息（元）",             fmt(d_diag.get("cash_div"))),
             ("10年股利次數",           d_diag.get("div_count_10y", 0)),
             ("3年平均股利",            fmt(d_diag.get("avg_div_3y"))),
+            ("6年平均股利",            fmt(d_diag.get("avg_div_6y"))),
+            ("10年平均股利",           fmt(d_diag.get("avg_div_10y"))),
             ("去年EPS",               fmt(d_diag.get("eps_prev"))),
             ("今年累積EPS",            fmt(d_diag.get("eps_ytd"))),
             ("3年平均EPS",             fmt(d_diag.get("avg_eps_3y"))),
-            ("配息率(3年均)",          fmt(d_diag.get("payout_3y"), 3)),
-            ("累積營收年增率",         fmt(d_diag.get("rev_ytd_yoy"), 2, "%")),
+            ("配息率(去年EPS基礎)",     fmt(d_diag.get("payout_ratio"), 3)),
+            ("配息率(3年均基礎)",       fmt(d_diag.get("payout_3y"), 3)),
+            ("累積營收年增率",          fmt(d_diag.get("rev_ytd_yoy"), 2, "%")),
             ("EPS年度比較",            fmt(d_diag.get("eps_yoy"), 4)),
-            ("推隔年殖利率(均)",        f"{d_diag['est_yield_avg']*100:.2f}%" if not np.isnan(d_diag.get("est_yield_avg", np.nan)) else "❌"),
-            ("推隔年殖利率(前季)",      f"{d_diag['est_yield_latest']*100:.2f}%" if not np.isnan(d_diag.get("est_yield_latest", np.nan)) else "❌"),
+            ("本益比",                 fmt(d_diag.get("pe_ratio"), 2)),
+            ("股價淨值比",             fmt(d_diag.get("pbr"), 2)),
+            ("推隔年殖利率(均)",        f"{d_diag['est_yield_avg']*100:.2f}%"
+                                       if not np.isnan(d_diag.get("est_yield_avg", np.nan)) else "❌"),
+            ("推隔年殖利率(前季)",      f"{d_diag['est_yield_latest']*100:.2f}%"
+                                       if not np.isnan(d_diag.get("est_yield_latest", np.nan)) else "❌"),
             ("推隔年本益比(均)",        fmt(d_diag.get("est_pe_avg"), 2)),
             ("推隔年本益比(前季)",      fmt(d_diag.get("est_pe_latest"), 2)),
             ("昂貴價(4%)",             fmt(d_diag.get("price_expensive"), 1)),
             ("合理價(5.5%)",           fmt(d_diag.get("price_fair"), 1)),
             ("便宜價(7%)",             fmt(d_diag.get("price_cheap"), 1)),
         ]
-        st.dataframe(pd.DataFrame(rows, columns=["指標", "計算值"]),
-                     use_container_width=True, hide_index=True)
+        st.dataframe(
+            pd.DataFrame(rows, columns=["指標", "計算值"]),
+            use_container_width=True, hide_index=True
+        )
+
+        st.markdown("### 6️⃣ 掃描池成交排行（前10筆）")
+        with st.spinner("抓取市場成交資料..."):
+            pool = get_top500_scan_pool(finmind_token)
+        if pool:
+            st.success(f"✅ 掃描池共 {len(pool)} 支")
+            st.write("前10支（依成交金額排序）：", pool[:10])
+        else:
+            st.error("❌ 無法取得掃描池，請確認 Token 或網路")
 
 
 st.divider()
