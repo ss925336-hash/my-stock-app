@@ -496,8 +496,8 @@ def calc_metrics_batch(stock_id, token):
 
 def get_tw_stock_list(token):
     """
-    回傳所有台股股票的 (stock_id, stock_name) 清單。
-    供批次篩選用（只取代號）與個股搜尋用（代號+名稱）。
+    回傳全市場台股 (stock_id, label) 清單（含名稱）。
+    用於個股儀表板搜尋選單（全市場，不限縮）。
     """
     try:
         params = {"dataset": "TaiwanStockInfo"}
@@ -508,8 +508,13 @@ def get_tw_stock_list(token):
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
             df["stock_id"] = df["stock_id"].astype(str)
-            # 篩選4~5碼（上市上櫃一般股 + 部分ETF如00878）
-            df = df[df["stock_id"].str.match(r"^\d{4,5}$")].copy()
+            # 4~5碼數字：上市上櫃個股 + ETF（00878等），排除債券ETF(B結尾)、ETN(N結尾)、權證
+            mask = (
+                df["stock_id"].str.match(r"^\d{4,5}$") &
+                ~df["stock_id"].str.endswith("B") &
+                ~df["stock_id"].str.endswith("N")
+            )
+            df = df[mask].copy()
             name_col = next((c for c in ["stock_name", "name", "Name"] if c in df.columns), None)
             if name_col:
                 df["_label"] = df["stock_id"] + "  " + df[name_col].fillna("")
@@ -523,19 +528,87 @@ def get_tw_stock_list(token):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def get_top500_scan_pool(token: str) -> list:
+    """
+    抓取前一交易日全市場成交數據（TaiwanStockPrice），
+    計算「成交金額 = 成交量 × 收盤價」，取前 500 名。
+
+    篩選規則（對應需求）：
+      ✅ 保留：4碼個股、重要 ETF（00878等5碼數字）
+      ❌ 排除：債券ETF（B結尾）、ETN（N結尾）、權證（含英文字母且非ETF）
+
+    回傳：已排序的股票代號清單（成交金額由大到小）
+    """
+    # 往前找最近5個交易日，確保抓到有資料的日期
+    for days_back in range(1, 8):
+        target_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        try:
+            params = {
+                "dataset": "TaiwanStockPrice",
+                "start_date": target_date,
+                "end_date": target_date,
+            }
+            if token:
+                params["token"] = token
+            r = requests.get(FINMIND_BASE, params=params, timeout=30)
+            data = r.json()
+            if data.get("status") == 200 and data.get("data"):
+                df = pd.DataFrame(data["data"])
+                if df.empty:
+                    continue
+
+                df["stock_id"] = df["stock_id"].astype(str)
+
+                # 篩選有效代號
+                valid_mask = (
+                    df["stock_id"].str.match(r"^\d{4,5}$") &          # 4~5碼純數字
+                    ~df["stock_id"].str.endswith("B") &                # 排除債券ETF
+                    ~df["stock_id"].str.endswith("N")                  # 排除ETN
+                )
+                df = df[valid_mask].copy()
+
+                # 計算成交金額（volume × close_price）
+                close_col  = next((c for c in ["close", "Close", "closing_price"] if c in df.columns), None)
+                volume_col = next((c for c in ["Trading_Volume", "volume", "Volume"] if c in df.columns), None)
+
+                if close_col and volume_col:
+                    df["_amount"] = (
+                        pd.to_numeric(df[close_col],  errors="coerce").fillna(0) *
+                        pd.to_numeric(df[volume_col], errors="coerce").fillna(0)
+                    )
+                else:
+                    # 欄位找不到，改用成交筆數或直接排序
+                    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                    df["_amount"] = df[num_cols[0]] if num_cols else 0
+
+                # 取前 500（依成交金額降序）
+                top500 = (
+                    df.sort_values("_amount", ascending=False)
+                    .drop_duplicates("stock_id")
+                    .head(500)["stock_id"]
+                    .tolist()
+                )
+                return top500  # 找到資料就返回，不繼續往前找
+        except Exception:
+            continue
+    return []  # 所有日期都失敗時回傳空清單
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def load_stock_options(token: str):
     """
-    啟動時快取完整股票清單，回傳：
-      options_labels : ["2330  台積電", "2882  國泰金", ...]  ← selectbox 用
-      label_to_id   : {"2330  台積電": "2330", ...}         ← 反查代號用
-      id_list       : ["2330", "2882", ...]                 ← 批次掃描用
+    啟動時快取完整股票清單（全市場），供個股搜尋使用。
+    回傳：
+      labels   : ["2330  台積電", "2882  國泰金", ...]  ← selectbox 用
+      label2id : {"2330  台積電": "2330", ...}          ← 反查代號用
+      id_list  : ["2330", "2882", ...]                  ← 全市場代號（備用）
     """
     pairs = get_tw_stock_list(token)
     if not pairs:
         return [], {}, []
-    labels    = [p[1] for p in pairs]
-    label2id  = {p[1]: p[0] for p in pairs}
-    id_list   = [p[0] for p in pairs]
+    labels   = [p[1] for p in pairs]
+    label2id = {p[1]: p[0] for p in pairs}
+    id_list  = [p[0] for p in pairs]
     return labels, label2id, id_list
 
 
@@ -620,12 +693,23 @@ with tab1:
 | EPS推隔年殖利率 | ≥ 門檻 | 6% |
 """)
     if run_btn:
-        with st.spinner("取得股票清單..."):
-            _, __, all_ids = load_stock_options(finmind_token)
-            if not all_ids:
-                all_ids = [str(i) for i in range(1101, 3700)] + [str(i) for i in range(4100, 6900)]
-            stock_sample = all_ids[:max_stocks]
-        st.info(f"掃描 {len(stock_sample)} 支，約需 {len(stock_sample)//4} 秒...")
+        with st.spinner("🔍 抓取市場成交排行，建立掃描池..."):
+            top500 = get_top500_scan_pool(finmind_token)
+            if top500:
+                # 成交金額前500，依使用者設定的上限截取
+                stock_sample = top500[:max_stocks]
+                st.success(
+                    f"📊 掃描池：成交金額前 {len(top500)} 名中，取前 **{len(stock_sample)}** 支"
+                    f"（已排除債券ETF、ETN、殭屍股）"
+                )
+            else:
+                # API 失敗時 fallback 到全市場清單
+                _, __, all_ids = load_stock_options(finmind_token)
+                if not all_ids:
+                    all_ids = [str(i) for i in range(1101, 3700)] + [str(i) for i in range(4100, 6900)]
+                stock_sample = all_ids[:max_stocks]
+                st.warning(f"⚠️ 無法取得成交排行，改用全市場清單（前 {len(stock_sample)} 支）")
+        st.info(f"開始掃描 {len(stock_sample)} 支，約需 {len(stock_sample)//4} 秒...")
         result_df = run_screening(
             min_yield, min_div_count, min_rev_ytd_yoy, min_rev_mom,
             min_eps_yoy, min_eps_est_yield, finmind_token, tuple(stock_sample)
