@@ -509,10 +509,12 @@ def get_tw_stock_list(token):
             df = pd.DataFrame(data["data"])
             df["stock_id"] = df["stock_id"].astype(str)
             # 4~5碼數字：上市上櫃個股 + ETF（00878等），排除債券ETF(B結尾)、ETN(N結尾)、權證
+            # 純個股過濾：只保留 4 碼純數字個股
+            # 排除：00開頭(ETF)、B結尾(債券ETF)、N結尾(ETN)、含字母(權證/可轉債)
             mask = (
-                df["stock_id"].str.match(r"^\d{4,5}$") &
-                ~df["stock_id"].str.endswith("B") &
-                ~df["stock_id"].str.endswith("N")
+                df["stock_id"].str.match(r"^[1-9]\d{3}$") &   # 嚴格4碼，首碼1~9（排除00開頭）
+                ~df["stock_id"].str.endswith("B") &              # 排除債券ETF
+                ~df["stock_id"].str.endswith("N")                # 排除ETN
             )
             df = df[mask].copy()
             name_col = next((c for c in ["stock_name", "name", "Name"] if c in df.columns), None)
@@ -560,10 +562,12 @@ def get_top500_scan_pool(token: str) -> list:
                 df["stock_id"] = df["stock_id"].astype(str)
 
                 # 篩選有效代號
+                # 純個股過濾：只保留 4 碼純數字個股
+                # 排除：00開頭(ETF/ETN)、B結尾(債券ETF)、N結尾(ETN)、含字母(權證)
                 valid_mask = (
-                    df["stock_id"].str.match(r"^\d{4,5}$") &          # 4~5碼純數字
-                    ~df["stock_id"].str.endswith("B") &                # 排除債券ETF
-                    ~df["stock_id"].str.endswith("N")                  # 排除ETN
+                    df["stock_id"].str.match(r"^[1-9]\d{3}$") &       # 嚴格4碼，首碼1~9
+                    ~df["stock_id"].str.endswith("B") &                 # 排除債券ETF
+                    ~df["stock_id"].str.endswith("N")                   # 排除ETN
                 )
                 df = df[valid_mask].copy()
 
