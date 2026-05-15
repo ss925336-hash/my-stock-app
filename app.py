@@ -495,6 +495,10 @@ def calc_metrics_batch(stock_id, token):
 
 
 def get_tw_stock_list(token):
+    """
+    回傳所有台股股票的 (stock_id, stock_name) 清單。
+    供批次篩選用（只取代號）與個股搜尋用（代號+名稱）。
+    """
     try:
         params = {"dataset": "TaiwanStockInfo"}
         if token:
@@ -503,11 +507,36 @@ def get_tw_stock_list(token):
         data = r.json()
         if data.get("status") == 200 and data.get("data"):
             df = pd.DataFrame(data["data"])
-            codes = df["stock_id"].dropna().astype(str)
-            return sorted(set(codes[codes.str.match(r"^\d{4}$")].tolist()))
+            df["stock_id"] = df["stock_id"].astype(str)
+            # 篩選4~5碼（上市上櫃一般股 + 部分ETF如00878）
+            df = df[df["stock_id"].str.match(r"^\d{4,5}$")].copy()
+            name_col = next((c for c in ["stock_name", "name", "Name"] if c in df.columns), None)
+            if name_col:
+                df["_label"] = df["stock_id"] + "  " + df[name_col].fillna("")
+            else:
+                df["_label"] = df["stock_id"]
+            pairs = list(zip(df["stock_id"].tolist(), df["_label"].tolist()))
+            return sorted(pairs, key=lambda x: x[0])
     except Exception:
         pass
     return []
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_stock_options(token: str):
+    """
+    啟動時快取完整股票清單，回傳：
+      options_labels : ["2330  台積電", "2882  國泰金", ...]  ← selectbox 用
+      label_to_id   : {"2330  台積電": "2330", ...}         ← 反查代號用
+      id_list       : ["2330", "2882", ...]                 ← 批次掃描用
+    """
+    pairs = get_tw_stock_list(token)
+    if not pairs:
+        return [], {}, []
+    labels    = [p[1] for p in pairs]
+    label2id  = {p[1]: p[0] for p in pairs}
+    id_list   = [p[0] for p in pairs]
+    return labels, label2id, id_list
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -592,10 +621,10 @@ with tab1:
 """)
     if run_btn:
         with st.spinner("取得股票清單..."):
-            all_stocks = get_tw_stock_list(finmind_token)
-            if not all_stocks:
-                all_stocks = [str(i) for i in range(1101, 3700)] + [str(i) for i in range(4100, 6900)]
-            stock_sample = all_stocks[:max_stocks]
+            _, __, all_ids = load_stock_options(finmind_token)
+            if not all_ids:
+                all_ids = [str(i) for i in range(1101, 3700)] + [str(i) for i in range(4100, 6900)]
+            stock_sample = all_ids[:max_stocks]
         st.info(f"掃描 {len(stock_sample)} 支，約需 {len(stock_sample)//4} 秒...")
         result_df = run_screening(
             min_yield, min_div_count, min_rev_ytd_yoy, min_rev_mom,
@@ -615,15 +644,30 @@ with tab1:
 # ══════════════════════════════════════════════════════
 with tab2:
     st.title("🔍 個股儀表板")
-    q_col, btn_col = st.columns([4, 1])
-    with q_col:
-        query_id = st.text_input("", placeholder="輸入股票代號，例如：2882、2330",
-                                  label_visibility="collapsed", key="stock_query")
-    with btn_col:
-        query_btn = st.button("查詢", use_container_width=True, type="primary")
 
-    if query_btn and query_id.strip():
-        sid = query_id.strip()
+    # ── 啟動時載入完整股票清單（快取，不重複請求）────────────
+    with st.spinner("載入股票清單..."):
+        _labels, _label2id, _id_list = load_stock_options(finmind_token)
+
+    if _labels:
+        # st.selectbox 支援鍵盤輸入即時過濾，在手機/桌面都能搜尋
+        # 使用者輸入「國泰」→ 自動列出含「國泰」的所有選項
+        selected_label = st.selectbox(
+            "搜尋股票（輸入代號或名稱關鍵字）",
+            options=[""] + _labels,          # 第一項空白 = 未選取
+            index=0,
+            placeholder="輸入代號或關鍵字，例如：2882 或 國泰",
+            key="stock_selectbox",
+        )
+        sid = _label2id.get(selected_label, "").strip() if selected_label else ""
+    else:
+        # FinMind 無法取得清單時，退回手動輸入
+        st.warning("⚠️ 無法載入股票清單（FinMind API 限流或無 Token），請手動輸入代號")
+        manual = st.text_input("手動輸入股票代號", placeholder="例如：2882", key="stock_manual")
+        sid = manual.strip()
+
+    # 有選到股票就立即查詢（不需按鈕，選即查）
+    if sid:
         with st.spinner(f"正在抓取 {sid} 數據..."):
             d = get_stock_data(sid, finmind_token)
 
@@ -856,8 +900,8 @@ with tab2:
             else:
                 st.info("無月營收資料")
 
-    elif query_btn:
-        st.warning("請輸入股票代號")
+    elif not sid:
+        st.info("👆 請在上方搜尋並選擇股票")
 
 
 # ══════════════════════════════════════════════════════
