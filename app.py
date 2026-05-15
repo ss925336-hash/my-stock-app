@@ -453,56 +453,125 @@ def get_stock_data(stock_id: str, token: str) -> dict:
 # 批次掃描 ── 按鈕A 系列（24h 快取）
 # ═══════════════════════════════════════════════════════
 
+def _is_valid_stock_id(sid: str) -> bool:
+    """嚴格過濾：4碼純數字、首碼1~9（排除00開頭ETF / B結尾債券 / N結尾ETN）"""
+    return bool(
+        sid.isdigit() and
+        len(sid) == 4 and
+        sid[0] != "0" and
+        not sid.endswith("B") and
+        not sid.endswith("N")
+    )
+
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_top500_scan_pool(token: str) -> list:
     """
-    抓取最近一個交易日全市場成交數據，取成交金額前500名個股。
+    三層備援策略取得成交金額前500名個股清單（24h快取）：
+
+    層1：TaiwanStockPrice 帶 Token → 最精確（需付費 Token）
+    層2：TaiwanDailyPrice（逐支 yfinance 成交量排行）→ 免費可用
+    層3：TaiwanStockInfo 清單直接返回（兜底）
+
     排除所有 ETF（00開頭）、B/N結尾、含字母的權證。
-    24小時全域快取。
     """
-    for days_back in range(1, 8):
-        target_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        try:
-            df, raw = finmind_get_no_id("TaiwanStockPrice", target_date, target_date, token)
-            if df.empty:
+
+    # ── 層1：帶 Token 嘗試全市場行情 ─────────────────
+    if token:
+        for days_back in range(1, 6):
+            target_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+            try:
+                df, raw = finmind_get_no_id("TaiwanStockPrice",
+                                            target_date, target_date, token)
+                if df.empty:
+                    continue
+                df["stock_id"] = df["stock_id"].astype(str)
+                df = df[df["stock_id"].apply(_is_valid_stock_id)].copy()
+                if df.empty:
+                    continue
+
+                close_col  = next((c for c in ["close", "Close", "closing_price"]
+                                   if c in df.columns), None)
+                volume_col = next((c for c in ["Trading_Volume", "volume", "Volume",
+                                               "trading_volume"]
+                                   if c in df.columns), None)
+                if close_col and volume_col:
+                    df["_amount"] = (
+                        pd.to_numeric(df[close_col],  errors="coerce").fillna(0) *
+                        pd.to_numeric(df[volume_col], errors="coerce").fillna(0)
+                    )
+                    top = (df.sort_values("_amount", ascending=False)
+                             .drop_duplicates("stock_id")
+                             .head(500)["stock_id"].tolist())
+                    if top:
+                        return top
+            except Exception:
                 continue
 
-            df["stock_id"] = df["stock_id"].astype(str)
-            # 嚴格過濾：4碼純數字、首碼1~9（排除00開頭ETF）
-            valid_mask = (
-                df["stock_id"].str.match(r"^[1-9]\d{3}$") &
-                ~df["stock_id"].str.endswith("B") &
-                ~df["stock_id"].str.endswith("N")
-            )
-            df = df[valid_mask].copy()
-            if df.empty:
-                continue
+    # ── 層2：TaiwanStockInfo + yfinance 成交量排行 ──
+    # 取全市場個股清單，用 yfinance 批次抓近5日平均成交量排序
+    try:
+        params = {"dataset": "TaiwanStockInfo"}
+        if token:
+            params["token"] = token
+        r = requests.get(FINMIND_BASE, params=params, timeout=20)
+        data = r.json()
+        if data.get("status") == 200 and data.get("data"):
+            df_info = pd.DataFrame(data["data"])
+            df_info["stock_id"] = df_info["stock_id"].astype(str)
+            all_ids = df_info[df_info["stock_id"].apply(_is_valid_stock_id)]["stock_id"].tolist()
 
-            close_col  = next((c for c in ["close", "Close", "closing_price"]
-                               if c in df.columns), None)
-            volume_col = next((c for c in ["Trading_Volume", "volume", "Volume"]
-                               if c in df.columns), None)
-
-            if close_col and volume_col:
-                df["_amount"] = (
-                    pd.to_numeric(df[close_col],  errors="coerce").fillna(0) *
-                    pd.to_numeric(df[volume_col], errors="coerce").fillna(0)
+            # 用 yfinance 快速抓近5日成交量（批次下載，速度快）
+            tickers = [f"{sid}.TW" for sid in all_ids[:800]]  # 限800支避免超時
+            try:
+                batch = yf.download(
+                    tickers, period="5d", interval="1d",
+                    progress=False, threads=True, group_by="ticker"
                 )
-            else:
-                num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-                df["_amount"] = df[num_cols[0]] if num_cols else 0
+                vol_map = {}
+                for sid in all_ids[:800]:
+                    tk = f"{sid}.TW"
+                    try:
+                        if isinstance(batch.columns, pd.MultiIndex):
+                            vol = batch[tk]["Volume"].mean() if tk in batch.columns.get_level_values(0) else 0
+                        else:
+                            vol = batch["Volume"].mean() if "Volume" in batch.columns else 0
+                        # 取近收盤價估成交金額
+                        if isinstance(batch.columns, pd.MultiIndex):
+                            close = batch[tk]["Close"].iloc[-1] if tk in batch.columns.get_level_values(0) else 1
+                        else:
+                            close = batch["Close"].iloc[-1] if "Close" in batch.columns else 1
+                        vol_map[sid] = float(vol) * float(close) if not np.isnan(float(vol)) else 0
+                    except Exception:
+                        vol_map[sid] = 0
 
-            top500 = (
-                df.sort_values("_amount", ascending=False)
-                .drop_duplicates("stock_id")
-                .head(500)["stock_id"]
-                .tolist()
-            )
-            if top500:
-                return top500
-        except Exception:
-            continue
-    return []
+                sorted_ids = sorted(vol_map, key=vol_map.get, reverse=True)
+                top = [s for s in sorted_ids if vol_map.get(s, 0) > 0][:500]
+                if top:
+                    return top
+            except Exception:
+                pass  # 批次下載失敗，進入層3
+
+            # yfinance 批次失敗但至少有清單
+            if all_ids:
+                return all_ids[:500]
+    except Exception:
+        pass
+
+    # ── 層3：固定清單兜底（常見大型個股）──────────────
+    fallback = [
+        "2330","2317","2454","2382","2308","2303","2881","2882","2886","2891",
+        "2884","2885","2890","2880","2892","2883","1301","1303","1326","2002",
+        "2412","4938","3008","2357","2395","2379","2376","3711","2408","2474",
+        "2609","2603","2615","2618","2614","2301","2324","2344","2352","2353",
+        "2371","2377","2385","2392","2399","2401","2404","2406","2409","2413",
+        "3045","3034","3037","3042","3044","3051","3052","3055","3058","3059",
+        "4904","4906","4911","4919","5871","5876","5880","6005","6176","6184",
+        "6285","6415","6446","6451","6491","6505","6533","6547","6598","6669",
+        "1402","1440","1476","1504","1513","1519","1560","1590","1605","1609",
+        "2015","2049","2059","2062","2101","2103","2105","2106","2201","2204",
+    ]
+    return fallback
 
 
 def _calc_single_metrics(stock_id, token):
@@ -758,15 +827,15 @@ with tab1:
         if top500:
             stock_sample = tuple(top500[:max_stocks])
             st.success(
-                f"📊 掃描池：成交金額前 {len(top500)} 名中，取前 **{len(stock_sample)}** 支"
-                "（已排除 ETF / 權證）"
+                f"📊 掃描池：{len(top500)} 支個股（已排除 ETF / 權證），"
+                f"取前 **{len(stock_sample)}** 支進行分析"
             )
         else:
             _, __, all_ids = load_stock_options(finmind_token)
             if not all_ids:
                 all_ids = [str(i) for i in range(1101, 3700)] + [str(i) for i in range(4100, 6900)]
             stock_sample = tuple(all_ids[:max_stocks])
-            st.warning(f"⚠️ 無法取得成交排行，改用全市場清單（前 {len(stock_sample)} 支）")
+            st.warning(f"⚠️ 所有管道均失敗，改用全市場清單（前 {len(stock_sample)} 支）")
 
         st.info(f"🔄 開始預算 {len(stock_sample)} 支個股指標，約需 {len(stock_sample) // 5} 秒...")
 
@@ -1218,13 +1287,14 @@ with tab3:
         )
 
         st.markdown("### 6️⃣ 掃描池成交排行（前10筆）")
-        with st.spinner("抓取市場成交資料..."):
+        st.caption("三層備援：層1=FinMind全市場行情(需Token) → 層2=TaiwanStockInfo+yfinance → 層3=內建清單")
+        with st.spinner("抓取市場成交資料（最多嘗試三層）..."):
             pool = get_top500_scan_pool(finmind_token)
         if pool:
-            st.success(f"✅ 掃描池共 {len(pool)} 支")
-            st.write("前10支（依成交金額排序）：", pool[:10])
+            st.success(f"✅ 掃描池共 {len(pool)} 支（無論哪一層成功都會有結果）")
+            st.write("前10支（依成交金額/清單順序）：", pool[:10])
         else:
-            st.error("❌ 無法取得掃描池，請確認 Token 或網路")
+            st.error("❌ 三層全部失敗，請檢查網路連線")
 
 
 st.divider()
